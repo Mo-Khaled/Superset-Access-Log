@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+intermittent-error/repro/.repro_ids.env
+intermittent-error/logs_before/*
+intermittent-error/logs_after/*
+!intermittent-error/logs_before/.gitkeep
+!intermittent-error/logs_after/.gitkeep

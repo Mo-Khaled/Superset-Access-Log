@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Superset Usage Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; background: #f7f7f9; color: #1a1a1a; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #666; margin-bottom: 20px; font-size: 13px; }
+  .controls { margin-bottom: 20px; }
+  select { padding: 6px 10px; font-size: 14px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  .card h2 { font-size: 15px; margin: 0 0 12px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: 600; }
+  .full { grid-column: 1 / -1; }
+</style>
+</head>
+<body>
+  <h1>Superset Usage Dashboard</h1>
+  <div class="sub">Reads only from MySQL — stays up independently of the source Superset instance.</div>
+
+  <div class="controls">
+    Window:
+    <select id="window">
+      <option value="7d">Last 7 days</option>
+      <option value="30d" selected>Last 30 days</option>
+      <option value="90d">Last 90 days</option>
+      <option value="all">All time</option>
+    </select>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Top most-visited dashboards</h2>
+      <canvas id="topChart" height="220"></canvas>
+    </div>
+    <div class="card">
+      <h2>Unique viewers vs. raw views (top dashboards)</h2>
+      <table id="uniqueTable">
+        <thead><tr><th>Dashboard</th><th>Views</th><th>Unique viewers</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="card full">
+      <h2>Trend over time — top dashboards</h2>
+      <canvas id="trendChart" height="100"></canvas>
+    </div>
+    <div class="card full">
+      <h2>Zero / near-zero view dashboards (deprecation candidates)</h2>
+      <table id="zeroTable">
+        <thead><tr><th>Dashboard</th><th>Owner(s)</th><th>Views in window</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+let topChart, trendChart;
+const palette = ["#4e79a7","#f28e2b","#e15759","#76b7b2","#59a14f","#edc949","#af7aa1","#ff9da7"];
+
+async function loadAll() {
+  const window_ = document.getElementById('window').value;
+
+  const top = await fetch(`/api/top-dashboards?window=${window_}`).then(r => r.json());
+  renderTop(top);
+  renderUniqueTable(top);
+
+  const trend = await fetch(`/api/trend?window=${window_}`).then(r => r.json());
+  renderTrend(trend);
+
+  const zero = await fetch(`/api/zero-view?window=${window_}`).then(r => r.json());
+  renderZeroTable(zero);
+}
+
+function renderTop(rows) {
+  const ctx = document.getElementById('topChart');
+  const data = {
+    labels: rows.map(r => r.title),
+    datasets: [{ label: 'Views', data: rows.map(r => r.view_count), backgroundColor: palette[0] }]
+  };
+  if (topChart) { topChart.data = data; topChart.update(); return; }
+  topChart = new Chart(ctx, { type: 'bar', data, options: { indexAxis: 'y', plugins: { legend: { display: false } } } });
+}
+
+function renderUniqueTable(rows) {
+  const tbody = document.querySelector('#uniqueTable tbody');
+  tbody.innerHTML = rows.map(r =>
+    `<tr><td>${r.title}</td><td>${r.view_count}</td><td>${r.unique_viewers}</td></tr>`
+  ).join('');
+}
+
+function renderTrend(payload) {
+  const ctx = document.getElementById('trendChart');
+  const allDays = new Set();
+  Object.values(payload.series).forEach(pts => pts.forEach(p => allDays.add(p.day)));
+  const days = Array.from(allDays).sort();
+
+  const datasets = payload.dashboards.map((d, i) => {
+    const byDay = Object.fromEntries((payload.series[d.dashboard_id] || []).map(p => [p.day, p.view_count]));
+    return {
+      label: d.title,
+      data: days.map(day => byDay[day] || 0),
+      borderColor: palette[i % palette.length],
+      backgroundColor: palette[i % palette.length],
+      fill: false,
+      tension: 0.2,
+    };
+  });
+
+  const data = { labels: days, datasets };
+  if (trendChart) { trendChart.data = data; trendChart.update(); return; }
+  trendChart = new Chart(ctx, { type: 'line', data, options: { responsive: true } });
+}
+
+function renderZeroTable(rows) {
+  const tbody = document.querySelector('#zeroTable tbody');
+  tbody.innerHTML = rows.map(r =>
+    `<tr><td>${r.title}</td><td>${r.owner_names || ''}</td><td>${r.view_count}</td></tr>`
+  ).join('');
+}
+
+document.getElementById('window').addEventListener('change', loadAll);
+loadAll();
+</script>
+</body>
+</html>

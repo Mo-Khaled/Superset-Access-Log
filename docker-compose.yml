@@ -1,0 +1,140 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init-examples-db.sql:/docker-entrypoint-initdb.d/init-examples-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mysql:
+    image: mysql:8.0
+    # PyMySQL (in the pipeline image) can't do caching_sha2_password without
+    # the `cryptography` package; simplest fix for a lab is the classic plugin.
+    command: ["--default-authentication-plugin=mysql_native_password"]
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    # No host port published: the host already has MySQL instances bound to
+    # 3306/3307. Pipeline/dashboard containers reach this over the compose
+    # network as `mysql:3306`; use `docker compose exec mysql mysql ...` for
+    # ad-hoc host-side inspection.
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./access-log-pipeline/schema:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  superset-init:
+    build: ./docker/superset
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - superset_home:/app/superset_home
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        superset db upgrade &&
+        superset fab create-admin \
+          --username "$${SUPERSET_ADMIN_USERNAME}" \
+          --password "$${SUPERSET_ADMIN_PASSWORD}" \
+          --firstname Admin --lastname User \
+          --email "$${SUPERSET_ADMIN_EMAIL}" || true &&
+        superset init &&
+        superset load_examples
+
+  superset:
+    build: ./docker/superset
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    command: ["gunicorn", "--config", "/app/pythonpath/gunicorn_config.py", "superset.app:create_app()"]
+    ports:
+      - "8089:8088"
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    volumes:
+      - superset_home:/app/superset_home
+
+  superset-worker:
+    build: ./docker/superset
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    command: ["celery", "--app=superset.tasks.celery_app:app", "worker", "--pool=prefork", "-O", "fair", "-c", "2"]
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    volumes:
+      - superset_home:/app/superset_home
+
+  superset-worker-beat:
+    build: ./docker/superset
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+    command: ["celery", "--app=superset.tasks.celery_app:app", "beat", "--pidfile=", "-s", "/app/superset_home/celerybeat-schedule"]
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    volumes:
+      - superset_home:/app/superset_home
+
+  pipeline:
+    build: ./access-log-pipeline
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      SUPERSET_BASE_URL: http://superset:8088
+      MYSQL_HOST: mysql
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./access-log-pipeline:/pipeline
+      - ./intermittent-error/repro:/repro
+      - ./intermittent-error/fix:/fix
+
+  usage-dashboard:
+    build: ./access-log-pipeline/dashboard
+    env_file: .env
+    environment:
+      MYSQL_HOST: mysql
+    ports:
+      - "8091:8090"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  mysql_data:
+  superset_home:
