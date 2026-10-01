@@ -130,16 +130,27 @@ services:
       - ./intermittent-error/repro:/repro
       - ./intermittent-error/fix:/fix
 
-  usage-dashboard:
-    build: ./access-log-pipeline/dashboard
+  # One-shot: provisions the native Superset "Superset Usage Analytics" dashboard
+  # (MySQL database connection + datasets + charts) so it's ready the moment the
+  # stack comes up. Idempotent -- see superset_bootstrap/bootstrap_dashboard.py.
+  # No compose healthcheck exists for `superset` today, so this polls /health
+  # itself rather than depending on `condition: service_healthy`.
+  superset-bootstrap:
+    build: ./access-log-pipeline
     env_file: .env
     environment:
+      SUPERSET_BASE_URL: http://superset:8088
       MYSQL_HOST: mysql
-    ports:
-      - "8091:8090"
+    command: ["python", "superset_bootstrap/bootstrap_dashboard.py"]
     depends_on:
+      superset-init:
+        condition: service_completed_successfully
+      superset:
+        condition: service_started
       mysql:
         condition: service_healthy
+    volumes:
+      - ./access-log-pipeline:/pipeline
 
 volumes:
   postgres_data:

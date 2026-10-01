@@ -22,14 +22,20 @@ docker compose logs -f superset-init   # wait for this to finish before using Su
 because that's already in use by another local project -- see `.env` /
 `docker-compose.yml` if you ever need to change it.)
 
-Once logged in: **Data > Databases** shows the two registered connections
-(`examples`, the seeded Superset demo DB), **Dashboards** shows the example
-dashboards (`load_examples` seeds these) plus anything the repro scripts created.
+Once logged in: **Data > Databases** shows the registered connections --
+`examples` (the seeded Superset demo DB) and `Access Log Pipeline (MySQL)` (the
+pipeline's own MySQL database, registered automatically by
+`superset-bootstrap`/`access-log-pipeline/superset_bootstrap/bootstrap_dashboard.py`).
+**Dashboards** shows the example dashboards (`load_examples` seeds these), the
+native **Superset Usage Analytics** dashboard, plus anything the Task 2 repro
+scripts created.
 
-## 2. Standalone usage dashboard
+## 2. Usage dashboard
 
-http://localhost:8091 -- the "most visited dashboards" view built by
-`access-log-pipeline/dashboard`. No login; reads only from MySQL.
+**Dashboards -> Superset Usage Analytics**, inside Superset itself (same URL/login
+as above) -- a native Superset dashboard built on the MySQL pipeline tables below.
+(The project previously shipped a standalone dashboard on port 8091; it's been
+replaced by this native one, so there's nothing separate to log into.)
 
 ## 3. Databases in DBeaver
 
@@ -79,8 +85,9 @@ Bank data, COVID vaccine data, etc.), plus, if you've run the Task 2 repro, the
 
 ### 3c. MySQL -- the access log pipeline's destination DB
 
-Entirely separate from Superset -- this is only ever written to by
-`etl/sync_logs.py` and read from by the usage dashboard.
+A separate database engine from Superset's own metadata store -- only ever
+written to by `etl/sync_logs.py`, and read from by Superset itself (registered as
+a database connection) to power the **Superset Usage Analytics** dashboard.
 
 | Setting | Value |
 |---|---|

@@ -1,6 +1,15 @@
 import os
 
+import pymysql
 from superset.utils.log import DBEventLogger
+
+# Superset's MySQL engine spec imports the `MySQLdb` (mysqlclient) module directly
+# for a few code paths (notably virtual/SQL-defined dataset column introspection)
+# regardless of which driver the connection's SQLAlchemy URI actually uses. We
+# connect with pymysql (no C build deps, already installed -- see Dockerfile), so
+# register it as a drop-in `MySQLdb` to satisfy those `import MySQLdb` calls
+# instead of adding the heavier mysqlclient build toolchain to the image.
+pymysql.install_as_MySQLdb()
 
 # --- Metadata DB (Superset's own state: users, dashboards, charts, the `logs` table) ---
 SQLALCHEMY_DATABASE_URI = (
@@ -60,6 +69,14 @@ SECRET_KEY = os.environ["SUPERSET_SECRET_KEY"]
 FEATURE_FLAGS = {
     "DASHBOARD_RBAC": False,
 }
+
+# --- TASK 1: lets superset_bootstrap/bootstrap_dashboard.py register the MySQL
+# pipeline DB as a Superset connection ---
+# Superset's SIP-15 "unsafe DB connection" guard (on by default) rejects adding a
+# database connection whose host resolves to a private/link-local IP -- which is
+# exactly what the `mysql` compose service's Docker-network hostname does. Safe to
+# disable here since this is a closed local lab network, not a multi-tenant deploy.
+PREVENT_UNSAFE_DB_CONNECTIONS = False
 
 # --- TASK 2: webserver/query timeouts ---
 # Deliberately short in the "before" state to reproduce the silent-kill bug; the

@@ -29,12 +29,50 @@ SOURCE_NAME = os.environ.get("ETL_SOURCE_NAME", "local_superset")
 # generic 'log' rows for non-view interactions) is still staged in raw_log_landing
 # for completeness, but excluded from fact_access_events since it's not a
 # dashboard/chart/export "access" event that the usage dashboard should count.
+#
+# "dashboard_load"/"chart_data" match the shape seed/generate_activity.py writes
+# directly into Postgres (mirroring what it documented as "exactly like the rows
+# Superset itself would write"). In practice, Superset 4.1.4's real frontend
+# logging pipeline does NOT write those as top-level `action` values for organic
+# browser usage -- it posts a generic `action='log'` row and nests the actual
+# event under `json.event_name` instead (see LOG_EVENT_NAME_MAP below). Both
+# paths are kept so the dashboard counts real usage *and* the seeded demo data.
 ACTION_MAP = {
     "dashboard_load": "dashboard_view",
     "chart_data": "chart_view",
     "export_csv": "export_csv",
     "export_excel": "export_excel",
 }
+
+# Maps the real event_name Superset's frontend nests inside a generic
+# action='log' row's `json` payload to the same fact_access_events.action
+# values as ACTION_MAP above.
+LOG_EVENT_NAME_MAP = {
+    "mount_dashboard": "dashboard_view",
+    "load_chart": "chart_view",
+    "force_refresh_chart": "chart_view",
+}
+
+
+def _classify_action(row):
+    """Returns the fact_access_events action for a raw log row, checking both
+    the top-level `action` column (seeded demo data) and, for generic 'log'
+    rows, the nested `json.event_name` (real Superset frontend logging)."""
+    action = row.get("action")
+    mapped = ACTION_MAP.get(action)
+    if mapped is not None:
+        return mapped
+    if action != "log":
+        return None
+    payload = row.get("json")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    return LOG_EVENT_NAME_MAP.get(payload.get("event_name"))
 
 
 def mysql_conn():
@@ -73,6 +111,21 @@ def set_sync_state(conn, last_log_id, last_ts):
             """,
             (SOURCE_NAME, last_log_id, last_ts),
         )
+
+
+def _parse_dttm(value):
+    """Best-effort parse of a dttm value (already a datetime from MySQL, or an
+    ISO-ish string as returned by LogRestApi JSON) into a naive UTC datetime
+    for comparison. Returns None if it can't be parsed."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
 def fetch_log_pages(client: SupersetClient, since_ts):
@@ -213,8 +266,7 @@ def run():
                 )
                 total_raw += 1
 
-                action = row.get("action")
-                fact_action = ACTION_MAP.get(action)
+                fact_action = _classify_action(row)
                 dttm = row.get("dttm")
                 if dttm:
                     max_ts = dttm
@@ -245,6 +297,21 @@ def run():
         conn.commit()
 
     if total_raw > 0:
+        # Guard against ever persisting a watermark that's in the future.
+        # Genuine Superset usage always logs dttm = real event time, but this
+        # sandbox's seed script (seed/generate_activity.py) backfills
+        # synthetic history whose timestamps aren't clamped to "now" -- a
+        # seeded row can land later in the day than the real wall clock. If
+        # such a row advances the watermark ahead of "now", every later
+        # *real* event today (dttm <= now < that future watermark) would be
+        # silently excluded by the `dttm > since_ts` filter above -- forever,
+        # since the watermark never rewinds. Capping at "now" just means a
+        # future-dated row gets safely re-fetched (and no-op re-ignored, via
+        # INSERT IGNORE) on later runs until real time catches up to it.
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        parsed_max_ts = _parse_dttm(max_ts)
+        if parsed_max_ts is not None and parsed_max_ts > now_utc:
+            max_ts = now_utc
         with conn.cursor() as cur:
             set_sync_state(conn, max_log_id, max_ts)
         conn.commit()

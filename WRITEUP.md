@@ -27,16 +27,19 @@ Superset logs these as genuinely separate events (`dashboard_load` vs.
 
 We do **not** collapse repeat views from the same user into one row. Real usage
 (a user refreshing, or checking back several times a day) is real activity; the
-usage dashboard instead reports raw view count *and* `COUNT(DISTINCT user_id)`
-("unique viewers") side by side specifically so "1 person refreshing constantly"
-and "20 people each checking once" are visibly distinguishable, per the ticket's
-requirement.
+native Superset "Superset Usage Analytics" dashboard (see
+`access-log-pipeline/superset_bootstrap/`) instead reports raw view count *and*
+`COUNT(DISTINCT user_id)` ("unique viewers") side by side specifically so "1
+person refreshing constantly" and "20 people each checking once" are visibly
+distinguishable, per the ticket's requirement.
 
 **Why dim tables instead of embedding names in the fact table?** Keeps the fact
 table narrow (just IDs + the event), avoids repeating a dashboard's title on every
 one of its thousands of view rows, and lets a title/owner change propagate without
 rewriting history -- standard star-schema reasoning, appropriate here because the
-usage dashboard's whole job is human-readable ranking, not raw ID lists.
+usage dashboard's whole job (now a native Superset dashboard rather than a
+standalone app, but same underlying MySQL tables) is human-readable ranking, not
+raw ID lists.
 
 **High-water-mark table (`etl_sync_state`)**: a single dedicated table rather than
 a local file, so the ETL is safe to run from any container/host/scheduler
@@ -144,3 +147,47 @@ their timeouts strictly increasing from database -> gunicorn -> any internal
 proxy -> the outermost load balancer/CDN, so whichever layer fails first is always
 the *database*, which is the only layer in this chain that reliably produces a
 catchable, loggable exception rather than a raw connection kill.
+
+## 4. Two ETL correctness bugs found (and fixed) while verifying the usage dashboard end-to-end
+
+Standing up the pipeline and checking the dashboard *looked* fine in isolation,
+but driving real traffic through it end-to-end (seed data -> ETL -> dashboard,
+then real browser clicks -> ETL -> dashboard) surfaced two real bugs in
+`etl/sync_logs.py`'s incremental sync, both now fixed:
+
+**Bug 1 -- the `dttm`-based watermark could advance into the future.**
+`LogRestApi` doesn't support filtering/ordering by `id`, so the incremental sync
+has to use `dttm > last_synced_ts` as its high-water-mark (see the comment in
+`fetch_log_pages`). `seed/generate_activity.py`'s `random_timestamp()` picks a
+random hour (7am-8pm) without clamping to the actual current time, so a seeded row
+can land *later in the day* than when the seed script actually ran. Once such a
+row advances the watermark, it sits ahead of real wall-clock time -- and every
+*real* event logged before that time of day (including genuine admin/user
+dashboard views) falls below the watermark and is silently, permanently excluded
+by the `>` filter. Symptom: re-running the ETL after real usage reports `0 raw
+rows staged, 0 fact rows inserted` indefinitely, even though new activity clearly
+exists in Superset's own `logs` table. **Fix**: cap the persisted watermark at
+`min(max_dttm_seen, now())` (`_parse_dttm` + the clamp at the end of `run()`) --
+a future-dated row still gets ingested in the run that sees it, it just can't push
+the *watermark* ahead of real time, so later real events stay visible to the
+`>` filter.
+
+**Bug 2 -- `ACTION_MAP` didn't recognize Superset's real frontend event names.**
+The seed script writes rows shaped like Superset's logging docs describe
+(`action = 'dashboard_load'` / `'chart_data'`), and `ACTION_MAP` was built to
+match that. Superset 4.1.4's actual frontend logging pipeline doesn't write those
+literal strings for organic browser usage, though -- it POSTs a generic
+`action = 'log'` row and nests the real event under `json.event_name`
+(`mount_dashboard`, `load_chart`, `force_refresh_chart`, confirmed by inspecting
+real rows in Postgres after clicking around the dashboard). Since `ACTION_MAP`
+only matched the top-level `action` column, **genuine usage was never being
+counted into `fact_access_events` at all** -- independent of bug 1, and much
+easier to miss, since the seeded demo data made the dashboard look populated and
+"working." **Fix**: `_classify_action()` now also unpacks `json.event_name` for
+generic `action = 'log'` rows via `LOG_EVENT_NAME_MAP`, so both the seeded demo
+traffic and real organic usage land in the fact table with the same semantics.
+
+Verified fixed end-to-end: after both fixes, a single real dashboard page load in
+the browser, followed by one incremental `etl/sync_logs.py` run, moved
+`fact_access_events`'s `dashboard_view` count by exactly +1 and was visible on the
+"Superset Usage Analytics" dashboard after a cache flush/refresh.

@@ -3,8 +3,9 @@
 A hands-on local reproduction of two Superset tickets:
 
 1. **Access log pipeline** (`access-log-pipeline/`) -- pull Superset's activity data
-   out via `LogRestApi`, land it in MySQL in a clean schema, and serve a standalone
-   "most visited dashboards" usage dashboard from it.
+   out via `LogRestApi`, land it in MySQL in a clean schema, and surface a
+   "most visited dashboards" usage dashboard as a **native Superset dashboard**
+   (auto-provisioned against that same MySQL data).
 2. **Intermittent silent error** (`intermittent-error/`) -- reproduce a gunicorn
    worker-timeout kill that shows a generic error to the user with nothing in
    Superset's application logs, then fix it.
@@ -25,7 +26,7 @@ access-log-pipeline/
   seed/generate_activity.py      simulates skewed multi-user dashboard traffic
   etl/sync_logs.py               incremental Superset logs -> MySQL ETL
   superset_client.py             shared Superset API auth helper
-  dashboard/                     standalone FastAPI + Chart.js usage dashboard
+  superset_bootstrap/            provisions the native Superset usage dashboard (DB conn, datasets, charts)
 intermittent-error/
   repro/                         creates the slow chart/dashboard + triggers the timeout
   fix/                           applies the timeout-alignment fix
@@ -42,7 +43,7 @@ docker compose up -d --build
 This starts Postgres (Superset's metadata + examples DB), Redis, MySQL (the
 pipeline's destination DB, entirely separate from Superset's own DB), the Superset
 webserver + Celery worker/beat, the `pipeline` tooling container, and the
-standalone `usage-dashboard` container.
+`superset-bootstrap` one-shot container.
 
 `superset-init` is a one-shot service that runs `superset db upgrade`, creates the
 admin user (`admin` / `admin`, see `.env`), runs `superset init` (roles/perms), and
@@ -51,6 +52,18 @@ webserver waits for it to complete successfully. Watch it with:
 
 ```bash
 docker compose logs -f superset-init
+```
+
+Once `superset-init` is done and the webserver is accepting connections,
+`superset-bootstrap` runs automatically: it registers the pipeline's MySQL
+database as a Superset connection, registers the relevant tables as Superset
+datasets, and creates the native **Superset Usage Analytics** dashboard + its 7
+charts (see `access-log-pipeline/superset_bootstrap/bootstrap_dashboard.py`).
+It's idempotent -- safe to re-run (`docker compose run --rm superset-bootstrap`)
+any time. Watch it with:
+
+```bash
+docker compose logs -f superset-bootstrap
 ```
 
 Once done, Superset is at **http://localhost:8089** (admin/admin; mapped from the
@@ -89,11 +102,23 @@ docker compose run --rm pipeline python etl/sync_logs.py
 Re-run it any time -- it's idempotent (tracks a high-water-mark in
 `etl_sync_state`, and every insert is keyed so re-runs don't duplicate rows).
 
-**View the standalone usage dashboard**: http://localhost:8091 -- reads only from
-MySQL, so it stays up even if Superset itself is down. Shows: top-N most-visited
-dashboards (selectable 7d/30d/90d/all window), a trend chart for the current top
-dashboards, unique viewers vs. raw view counts per dashboard, and a
-zero/near-zero-views list (deprecation candidates).
+**View the usage dashboard**: log into Superset at http://localhost:8089
+(admin/admin) and open **Dashboards -> Superset Usage Analytics**. It's a native
+Superset dashboard, auto-provisioned by `superset-bootstrap` against the same
+MySQL tables the ETL writes to, with 7 charts:
+
+- **Total Dashboard Views** / **Active Users** -- headline KPI numbers.
+- **Most Viewed Dashboards** -- ranked table (view count + unique viewers per
+  dashboard), same ranking logic the old standalone dashboard used.
+- **Dashboard Views Over Time** -- daily trend line.
+- **User Activity** -- per-user view/chart-view counts and last-active time.
+- **Zero-View Dashboards** -- near-zero-views list (deprecation candidates).
+- **Export Activity** -- `export_csv` / `export_excel` counts.
+
+Since these are ordinary Superset charts, you get Superset's native dashboard
+time-range filter, drill-downs, and export-to-CSV for free -- no separate service
+to keep running. (The project previously shipped a standalone FastAPI + Chart.js
+dashboard on port 8091 for this; it's been replaced by this native dashboard.)
 
 **Scheduling in prod**: this ETL is designed to be invoked externally, not to loop
 internally. In this sandbox, cron works fine:
