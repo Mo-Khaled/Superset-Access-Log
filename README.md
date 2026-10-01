@@ -139,11 +139,32 @@ updated_at` goes stale beyond N missed intervals. See `WRITEUP.md` for detail.
 docker compose run --rm pipeline python /repro/create_slow_dataset.py
 ```
 
+Idempotent -- re-running it deletes any leftover `slow_query_demo` dataset from a
+previous run before creating a fresh one. Note that Superset introspects the
+virtual dataset's columns by actually running the query at creation time, so this
+call can take several multiples of `SLEEP_SECONDS`, not just `SLEEP_SECONDS` --
+the client timeout accounts for that.
+
+> **Git Bash / MSYS on Windows**: leading-slash paths like `/repro/...` and
+> `/fix/...` get rewritten to a Windows path by MSYS's automatic path conversion
+> and the container command will fail with "No such file or directory". Prefix the
+> command with `MSYS_NO_PATHCONV=1` if you hit this, e.g.
+> `MSYS_NO_PATHCONV=1 docker compose run --rm pipeline python /repro/create_slow_dataset.py`.
+
 **Trigger the "before" repro** (run on the HOST, not in a container, so it can
 shell out to `docker compose logs`):
 
 ```bash
 python intermittent-error/repro/trigger_timeout.py before
+```
+
+The slow chart's query result is cacheable, and its SQL text never changes between
+runs, so Superset/Redis will happily serve a cached (fast, non-representative)
+response on any repeat trigger within the chart's cache window. If you re-run
+`before`, or `after`, or re-run the same phase twice, flush the cache first so the
+query actually executes:
+```bash
+docker compose exec redis redis-cli FLUSHALL
 ```
 
 `.env` starts with `SUPERSET_WEBSERVER_TIMEOUT=15`, shorter than the 45s slow
@@ -180,13 +201,23 @@ query is cancelled by Postgres at ~20s, Superset's chart-data endpoint catches t
 `QueryCanceled` error and logs it properly, and the client gets a real (still
 user-facing, but now *logged*) error instead of a silent hang-then-kill.
 
-A gunicorn `worker_abort` hook (`docker/superset/gunicorn_config.py`) runs in both
-scenarios as a second, independent safety net -- it fires right before the arbiter
-kills a worker and logs the in-flight request path + duration to the container's
-log stream, regardless of what Superset's own app-level logging does. In the
-"after" state you should see it stay silent (proof the DB-side fix is catching the
-timeout first); it only fires in the "before" state or for a slow path that isn't
-DB-bound at all.
+A gunicorn `worker_abort` hook (`docker/superset/gunicorn_config.py`) is intended as
+a second, independent safety net in the "before" scenario -- meant to fire right
+before the arbiter kills a worker and log the in-flight request path + duration to
+the container's log stream, regardless of what Superset's own app-level logging
+does. **In practice, in this repro, it doesn't fire**: the arbiter sends `SIGABRT`
+first (which is what should trigger the hook) and only escalates to `SIGKILL` on
+its *next* sweep roughly a second later, but the worker is blocked the whole time
+inside a synchronous `psycopg2` call in native code -- and a Python signal handler
+can't run until the interpreter regains control, which never happens before
+`SIGKILL` lands. The captured logs confirm this: `[CRITICAL] WORKER TIMEOUT`
+followed directly by `[ERROR] ... sent SIGKILL`, no `WORKER_ABORT` line in between.
+The hook would still catch a slow-but-Python-level stall (e.g. a hung pure-Python
+computation that periodically returns to the interpreter loop); it's not the
+reliable catch-all for a blocked C-level DB call the original design intended. In
+the "after" state it's silent for a simpler reason -- Postgres cancels the query
+well before gunicorn's timeout is even reached, so the worker is never a `SIGKILL`
+candidate in the first place.
 
 See `WRITEUP.md` for the full root-cause writeup, and an explicit callout on what
 differs in a real prod deployment (this sandbox has no reverse proxy/load balancer

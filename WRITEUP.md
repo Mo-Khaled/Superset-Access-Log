@@ -82,7 +82,16 @@ The browser sees the connection drop or a generic 5xx from nowhere; app-level lo
 useful -- at best a terse arbiter line in a different log stream that nobody was
 watching. This is exactly the "intermittent, unreproducible, invisible to logs"
 signature described in the ticket, and it reproduces reliably any time a query
-takes longer than `SUPERSET_WEBSERVER_TIMEOUT` / the gunicorn `timeout`.
+takes longer than `SUPERSET_WEBSERVER_TIMEOUT` / the gunicorn `timeout` -- **with
+one important precondition**: gunicorn's `timeout` only actually protects against
+this if `worker_class = "sync"` (the default). With `worker_class = "gthread"`
+(tried first in this lab), the worker's main event loop calls the arbiter's
+`notify()` heartbeat on every iteration of its own accept/select loop, completely
+independent of whether a pooled request-handling thread is stuck in a slow query --
+so the arbiter never sees the worker go stale, `timeout` silently stops doing
+anything, and the "before" repro just returns a slow-but-successful response
+instead of reproducing the bug. `docker/superset/gunicorn_config.py` uses `sync`
+for exactly this reason.
 
 **Recommended fix, in priority order**:
 
@@ -96,10 +105,23 @@ takes longer than `SUPERSET_WEBSERVER_TIMEOUT` / the gunicorn `timeout`.
 2. **Add a server-side watchdog independent of app logging**, for the cases the
    DB-side fix can't cover (e.g. a genuinely slow non-DB computation, a hung
    network call to some other service). Gunicorn's `worker_abort` hook
-   (`docker/superset/gunicorn_config.py`) fires on the worker process right before
-   it's killed and logs the request path + how long it had been running -- this
-   works precisely because it's the one hook gunicorn still calls even when app
-   code has lost control.
+   (`docker/superset/gunicorn_config.py`) is *intended* to fire on the worker
+   process right before it's killed and log the request path + how long it had
+   been running, on the theory that it's the one hook gunicorn still calls even
+   when app code has lost control. **Caveat found while validating this repro**:
+   that theory only holds if the worker is blocked somewhere that still yields to
+   the interpreter's signal handling. When it's blocked inside a synchronous
+   C-level call (e.g. `psycopg2` executing a query, as in this repro's own DB
+   timeout), the arbiter's `SIGABRT` (which should trigger the hook) can't be
+   handled until the call returns -- and by then `SIGKILL` has already landed on
+   the arbiter's next sweep, ~1s later. Confirmed empirically: the captured
+   "before" logs show `[CRITICAL] WORKER TIMEOUT` directly followed by
+   `[ERROR] ... sent SIGKILL`, with no `WORKER_ABORT` line from the hook in
+   between. So this watchdog is real defense-in-depth for a hung *Python-level*
+   computation, but not for a hung synchronous DB driver call -- which is
+   precisely the failure mode fix #1 already targets. A more complete version of
+   this watchdog would run the blocking call in a separate thread so the main
+   worker thread stays responsive to signals -- not implemented here.
 3. **(Not implemented here, noted as further work)** a frontend-side reporting
    hook: Superset's chart components already know when a fetch fails or never
    resolves; wiring that to POST a small "client observed a failed/timed-out chart
