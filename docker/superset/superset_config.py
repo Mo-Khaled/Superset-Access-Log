@@ -49,7 +49,8 @@ CELERY_CONFIG = CeleryConfig
 
 CACHE_CONFIG = {
     "CACHE_TYPE": "RedisCache",
-    "CACHE_DEFAULT_TIMEOUT": 300,
+    # seconds a cached chart result is reused; set CACHE_TIMEOUT_SECONDS in .env
+    "CACHE_DEFAULT_TIMEOUT": int(os.environ.get("CACHE_TIMEOUT_SECONDS", "300")),
     "CACHE_KEY_PREFIX": "superset_",
     "CACHE_REDIS_HOST": REDIS_HOST,
     "CACHE_REDIS_PORT": REDIS_PORT,
