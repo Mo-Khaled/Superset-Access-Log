@@ -5,3 +5,15 @@ intermittent-error/logs_before/*
 intermittent-error/logs_after/*
 !intermittent-error/logs_before/.gitkeep
 !intermittent-error/logs_after/.gitkeep
+
+# local secrets / config (copy .env.example -> .env)
+.env
+
+# local tooling / editor
+.claude/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
