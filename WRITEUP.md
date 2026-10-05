@@ -41,6 +41,14 @@ usage dashboard's whole job (now a native Superset dashboard rather than a
 standalone app, but same underlying MySQL tables) is human-readable ranking, not
 raw ID lists.
 
+**Errors (`fact_error_events`)**: failures are kept out of `fact_access_events`
+(which counts every `load_chart` as a view) and recorded in their own table with a
+`source` (`browser` = the client-side `load_chart` row with `has_err`; `gunicorn` =
+the arbiter's `WORKER TIMEOUT` line from container stdout) and a human-readable
+`reason`. Two sources because neither is complete: the browser knows the user and
+chart but only that it timed out; gunicorn knows why but not who. `dedupe_key` keeps
+re-ingestion idempotent.
+
 **High-water-mark table (`etl_sync_state`)**: a single dedicated table rather than
 a local file, so the ETL is safe to run from any container/host/scheduler
 instance without needing shared local disk -- state lives in the same MySQL
@@ -95,6 +103,15 @@ so the arbiter never sees the worker go stale, `timeout` silently stops doing
 anything, and the "before" repro just returns a slow-but-successful response
 instead of reproducing the bug. `docker/superset/gunicorn_config.py` uses `sync`
 for exactly this reason.
+
+**What actually lands in the logs (verified)**: the only server-side trace is the
+arbiter's `[CRITICAL] WORKER TIMEOUT` / `[ERROR] ... SIGKILL` pair in container
+stdout (the "Perhaps out of memory?" text is gunicorn boilerplate, not a real OOM).
+Superset's `logs` table has **no row** for the killed chart-data request. The one
+exception is a *client-side* `load_chart` event the browser posts afterwards
+(`action = 'log'`, `json.has_err = true`, `json.error_details = "timeout"`,
+`duration` ~ the gunicorn timeout). It exists only if the browser tab survives long
+enough to flush it, so it is not a reliable record.
 
 **Recommended fix, in priority order**:
 
@@ -191,3 +208,28 @@ Verified fixed end-to-end: after both fixes, a single real dashboard page load i
 the browser, followed by one incremental `etl/sync_logs.py` run, moved
 `fact_access_events`'s `dashboard_view` count by exactly +1 and was visible on the
 "Superset Usage Analytics" dashboard after a cache flush/refresh.
+
+## 5. Simulating the "error, then fine after refresh" variant (cache-driven)
+
+In practice the timeout often disappears on refresh. The cause is the data cache
+(`CACHE_CONFIG` / `DATA_CACHE_CONFIG`, Redis db 2, 300s TTL): a request killed at the
+gunicorn timeout never writes a result, so a cold load always fails, but if something
+else completes the same query (a path with no 15s limit, a Celery/warm-up job, another
+session) the result is cached and the next load is instant until the TTL expires. That
+is the intermittent behaviour: it depends on cache state, not on the query.
+
+**Timing constraint**: the slow query must sit *between* the two limits. The DB
+`statement_timeout` (20s, from `fix/apply_fix.py`) is lower than a `pg_sleep(45)`
+query, so with the original 45s sleep even a no-timeout server cancels the query and
+caches nothing. The lab now uses `SLOW_QUERY_SLEEP_SECONDS=18`: above the 15s gunicorn
+timeout (port 8089 fails) and below the 20s DB timeout (a no-limit server succeeds).
+
+**Steps** (verified working):
+1. Flush only the cache: `docker compose exec redis redis-cli -n 2 FLUSHDB`
+   (db 2 only, so the Celery broker is untouched).
+2. Start a Superset with no gunicorn limit on the same Redis/DB:
+   `docker compose run -d --name superset-nolimit -p 8090:8088 superset superset run -h 0.0.0.0 -p 8088 --with-threads`
+3. Load the dashboard on `localhost:8089` -> times out at ~15s (cold cache).
+4. Load it on `localhost:8090` -> succeeds at ~18s and populates the cache.
+5. Refresh `localhost:8089` -> instant, served from cache. After 300s the error returns.
+6. Clean up: `docker rm -f superset-nolimit`.

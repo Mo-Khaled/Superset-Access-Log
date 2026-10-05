@@ -8,7 +8,8 @@ A hands-on local reproduction of two Superset tickets:
    (auto-provisioned against that same MySQL data).
 2. **Intermittent silent error** (`intermittent-error/`) -- reproduce a gunicorn
    worker-timeout kill that shows a generic error to the user with nothing in
-   Superset's application logs, then fix it.
+   Superset's application logs, then fix it. (`intermittent-error/DEMO.md` walks through showing the
+   unlogged, cache-dependent version without applying the fix.)
 
 Everything runs via Docker Compose. Superset version: **`apache/superset:4.1.4`**
 (pinned; note that 5.x/6.x exist upstream -- this lab uses 4.1.x for documentation
@@ -18,25 +19,31 @@ against a newer version).
 ## Layout
 
 ```
-docker-compose.yml, .env         top-level orchestration
+docker-compose.yml               top-level orchestration
+.env.example                     copy to .env (git-ignored) before first run
 docker/superset/                 custom Superset image (config, gunicorn config)
 docker/postgres/                 creates the separate "examples" DB on the same PG instance
 access-log-pipeline/
   schema/                        MySQL DDL (auto-applied on first mysql container boot)
   seed/generate_activity.py      simulates skewed multi-user dashboard traffic
-  etl/sync_logs.py               incremental Superset logs -> MySQL ETL
+  etl/sync_logs.py               incremental Superset logs -> MySQL ETL (+ browser errors)
+  etl/ingest_container_errors.py gunicorn WORKER TIMEOUT lines -> fact_error_events
+  etl/backfill_browser_errors.py one-off: derive error rows from already-staged raw logs
+  run_etl.sh                     one scheduled cycle (both ETL steps); what cron calls
   superset_client.py             shared Superset API auth helper
   superset_bootstrap/            provisions the native Superset usage dashboard (DB conn, datasets, charts)
 intermittent-error/
-  repro/                         creates the slow chart/dashboard + triggers the timeout
+  DEMO.md                        step-by-step demo of the intermittent, unlogged timeout
+  repro/                         slow chart/dashboard, trigger, show_evidence.sh
   fix/                           applies the timeout-alignment fix
   logs_before/, logs_after/      captured evidence (created when you run the repro)
-WRITEUP.md                       schema rationale, ETL scheduling, root cause + prod fix
+WRITEUP.md                       schema rationale, ETL scheduling, root cause + prod fix, cache-driven repro
 ```
 
 ## 1. Bring up the stack
 
 ```bash
+cp .env.example .env   # first time only; set real passwords
 docker compose up -d --build
 ```
 
@@ -124,14 +131,39 @@ dashboard on port 8091 for this; it's been replaced by this native dashboard.)
 internally. In this sandbox, cron works fine:
 
 ```cron
-*/10 * * * * docker compose run --rm pipeline python etl/sync_logs.py >> /var/log/superset-log-etl.log 2>&1
+*/10 * * * * /path/to/repo/access-log-pipeline/run_etl.sh >> /var/log/superset-log-etl.log 2>&1
 ```
+
+`run_etl.sh` is one cycle: the Superset `logs` ETL, then ingestion of gunicorn
+`WORKER TIMEOUT` lines from the container's stdout into `fact_error_events` (see
+below). Needs the `pipeline` container up. The log window it re-reads
+(`ERROR_LOG_WINDOW`, default 15m) must be longer than the cron interval; overlap is
+harmless because rows are de-duplicated.
 
 In prod, prefer an orchestrator with retry/alerting built in -- an Airflow DAG
 (`PythonOperator` or a `KubernetesPodOperator` running this same script, with a
 failure callback wired to Slack/PagerDuty) or a Kubernetes `CronJob` with
 `restartPolicy: OnFailure` plus a liveness/log-based alert if `etl_sync_state.
 updated_at` goes stale beyond N missed intervals. See `WRITEUP.md` for detail.
+
+### Errors table (`fact_error_events`)
+
+`fact_access_events` counts every `load_chart` as a `chart_view`, so a chart that
+failed to load looks like a normal view there (deliberate: it is a usage table).
+Failures and their reasons go to `fact_error_events` instead, from two sources:
+
+- `browser`: `load_chart` rows in Superset's `logs` table with `has_err = true`
+  (user, dashboard, chart, error such as `timeout`, duration).
+- `gunicorn`: `WORKER TIMEOUT` lines from the superset container's stdout, the only
+  server-side trace of a request killed by the gunicorn timeout (reason, but no
+  user/dashboard/chart). Match the two by timestamp.
+
+```bash
+# schema is auto-applied on a fresh mysql volume; on an existing one:
+docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"'   < access-log-pipeline/schema/006_fact_error_events.sql
+# one-off, only if raw_log_landing already holds failures from before this table:
+docker compose exec -T pipeline python etl/backfill_browser_errors.py
+```
 
 ### What `LogRestApi` does and doesn't capture
 

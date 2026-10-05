@@ -75,6 +75,50 @@ def _classify_action(row):
     return LOG_EVENT_NAME_MAP.get(payload.get("event_name"))
 
 
+def extract_browser_error(row):
+    """Returns a fact_error_events dict for a browser-reported chart load failure
+    (generic action='log' row, json.event_name='load_chart', json.has_err=true),
+    else None. This runs *in addition to* the fact_access_events insert, which
+    still counts the same row as a normal chart_view."""
+    if row.get("action") != "log":
+        return None
+    payload = row.get("json")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("event_name") != "load_chart" or not payload.get("has_err"):
+        return None
+    details = str(payload.get("error_details") or "unknown")
+    duration = payload.get("duration")
+    reason = f"Browser reported chart load failure: {details}"
+    if duration is not None:
+        reason += f" after {int(duration)} ms"
+    return {
+        "error_type": details[:50],
+        "reason": reason[:500],
+        "duration_ms": int(duration) if duration is not None else None,
+        "chart_id": row.get("slice_id"),
+    }
+
+
+def insert_error_event(cur, row, err):
+    cur.execute(
+        """
+        INSERT IGNORE INTO fact_error_events
+            (event_ts, source, error_type, reason, user_id, dashboard_id,
+             chart_id, duration_ms, raw_log_id, dedupe_key)
+        VALUES (%s, 'browser', %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (row.get("dttm"), err["error_type"], err["reason"], row.get("user_id"),
+         row.get("dashboard_id"), err["chart_id"], err["duration_ms"],
+         row["id"], f"browser:{row['id']}"),
+    )
+
+
 def mysql_conn():
     return pymysql.connect(
         host=os.environ["MYSQL_HOST"],
@@ -247,7 +291,7 @@ def run():
     last_log_id, last_ts = get_sync_state(conn)
 
     dashboard_cache, user_cache = {}, {}
-    total_raw, total_fact = 0, 0
+    total_raw, total_fact, total_err = 0, 0, 0
     max_log_id = last_log_id
     max_ts = last_ts
 
@@ -277,6 +321,11 @@ def run():
 
                 dashboard_id = row.get("dashboard_id")
                 upsert_dim_dashboard(client, dashboard_cache, cur, dashboard_id)
+
+                browser_err = extract_browser_error(row)
+                if browser_err is not None:
+                    insert_error_event(cur, row, browser_err)
+                    total_err += 1
 
                 if fact_action is None:
                     continue  # staged in raw_log_landing only; not an access event we rank on
@@ -317,7 +366,8 @@ def run():
         conn.commit()
 
     print(f"synced through log id {max_log_id}: {total_raw} raw rows staged, "
-          f"{total_fact} fact rows inserted (dupes ignored on re-run)")
+          f"{total_fact} fact rows inserted, {total_err} browser errors seen "
+          f"(dupes ignored on re-run)")
     conn.close()
 
 
