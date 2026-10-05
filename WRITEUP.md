@@ -117,8 +117,8 @@ The query must take longer than gunicorn's timeout but shorter than the DB's. He
 15s gunicorn < **18s query** < 20s DB `statement_timeout`.
 
 1. Clear the cache: `docker compose exec redis redis-cli -n 2 FLUSHDB`
-2. Start a Superset with no gunicorn limit:
-   `docker compose run -d --name superset-nolimit -p 8090:8088 superset superset run -h 0.0.0.0 -p 8088 --with-threads`
+2. Start a Superset with no gunicorn limit. The 60 s timeout also stops the browser from giving up at 15 s:
+   `docker compose run -d --name superset-nolimit -e SUPERSET_WEBSERVER_TIMEOUT=60 -p 8090:8088 superset superset run -h 0.0.0.0 -p 8088 --with-threads`
 3. Load the dashboard on `localhost:8089`: it times out at about 15s.
 4. Load it on `localhost:8090`: it succeeds at about 18s and fills the cache.
 5. Refresh `localhost:8089`: instant. After 300s the error comes back.
