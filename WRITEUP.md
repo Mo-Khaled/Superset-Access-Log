@@ -50,7 +50,8 @@ The user just sees an error.
 | Container output (`docker compose logs superset`) | Yes: `WORKER TIMEOUT` then `SIGKILL`. The "out of memory?" text is gunicorn boilerplate, not a real OOM. |
 | Superset's `logs` table, server side | No row for the killed request. |
 | Superset's `logs` table, browser side | Sometimes: a `load_chart` row with `has_err = true` and `timeout`, but only if the browser tab survives long enough to send it. |
-| The MySQL pipeline | It reads the `logs` table, so it misses the server side too. The browser row is even counted as a normal `chart_view`. |
+| `fact_access_events` (MySQL) | It reads the `logs` table, so it misses the server side. The browser row is even counted as a normal `chart_view`. |
+| `fact_error_events` (MySQL) | Yes, once the ETL has run: one `browser` row and one `gunicorn` row per failure (see below). |
 
 **Why it is "intermittent": the cache.** Query results are cached in Redis for 300s.
 A killed request never writes a result, so a cold load always fails. If anything
@@ -66,6 +67,24 @@ because neither is complete on its own:
   itself has only a worker id, so each worker also logs a `REQTRACE` line (pid, user,
   URL) when a request starts. The ingest joins the timeout to that pid's last trace
   line and fills in the user, dashboard and chart.
+
+How the pieces fit:
+
+```
+browser load_chart (has_err)   -> Superset logs table --sync_logs.py--------------> fact_error_events (source=browser)
+worker REQTRACE line (pid,user,URL) --gunicorn WORKER TIMEOUT (pid)     ----+--ingest_container_errors.py---------------> fact_error_events (source=gunicorn)
+                                      (joined on the worker pid)
+```
+
+The trace line is written when a request *starts*, because a killed request never
+reaches any "request finished" hook. `run_etl.sh` runs both steps on one cron entry.
+
+Example from this lab (one dashboard load, a few seconds apart):
+
+| event_ts | source | user | dashboard | chart | reason |
+|---|---|---|---|---|---|
+| 08:24:24 | gunicorn | 1 | 13 | 204 | worker pid 8 exceeded the 15s timeout and was SIGKILLed; request was `POST /api/v1/chart/data` |
+| 08:24:25 | browser | 1 | 13 | 204 | timeout after 15016 ms |
 
 `fact_access_events` is left as is, so a failed load still counts as a view there.
 That is deliberate: it shows why the usage table alone cannot be trusted for errors.
