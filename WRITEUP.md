@@ -1,235 +1,133 @@
 # Write-up
 
-## 1. MySQL schema design rationale
+Plain-language notes on the decisions behind this lab. Setup and commands are in
+[README.md](README.md); the demo script is in [intermittent-error/DEMO.md](intermittent-error/DEMO.md).
 
-**Why a raw landing table (`raw_log_landing`) in addition to fact/dim tables?**
-`LogRestApi` is our only window into Superset's activity history, and Superset's
-own retention on the `logs` table is whatever ops configures (often short, to keep
-the metadata DB small). If we only ever wrote directly to `fact_access_events` and
-later discovered a bug in the transform (e.g. a misclassified action, or a new
-action type we want to start tracking), we'd have no way to re-derive the fact
-table without re-pulling data that may have already aged out on the Superset side.
-Staging the raw JSON payload first (keyed by `source_log_id`, Superset's own log
-row id) means the transform can be re-run against history we already have,
-independent of Superset's retention window.
+## 1. How the MySQL data is organised
 
-**Why separate dashboard-view and chart-view events instead of one "visit" row?**
-Superset logs these as genuinely separate events (`dashboard_load` vs.
-`chart_data`), and they answer different questions:
-- A **dashboard view** (`fact_access_events.action = 'dashboard_view'`) means a
-  user opened the dashboard page. This is what "most visited dashboards" should
-  rank on -- it doesn't scale with how many charts happen to be on the page.
-- A **chart view** (`action = 'chart_view'`) means one specific chart tile's data
-  was fetched. Useful for a different question ("which charts within a busy
-  dashboard are actually being looked at") but wrong to use for the top-level
-  ranking, since a 10-chart dashboard would look 10x more "popular" than a
-  1-chart one purely from tile count, not distinct visits.
+Superset's activity is pulled through `LogRestApi` into MySQL like this:
 
-We do **not** collapse repeat views from the same user into one row. Real usage
-(a user refreshing, or checking back several times a day) is real activity; the
-native Superset "Superset Usage Analytics" dashboard (see
-`access-log-pipeline/superset_bootstrap/`) instead reports raw view count *and*
-`COUNT(DISTINCT user_id)` ("unique viewers") side by side specifically so "1
-person refreshing constantly" and "20 people each checking once" are visibly
-distinguishable, per the ticket's requirement.
+| Table | What it holds | Why it exists |
+|---|---|---|
+| `raw_log_landing` | The untouched JSON of every Superset log row | Superset may delete old logs. With a raw copy we can rebuild the other tables later if we find a bug or want a new metric. |
+| `fact_access_events` | One row per dashboard view, chart view or export | The usage numbers. |
+| `fact_error_events` | One row per failure, with its reason | See section 3. |
+| `dim_users`, `dim_dashboards` | Names and owners | Keeps the fact table small and lets a renamed dashboard show its new title everywhere. |
+| `etl_sync_state` | "How far did we get last time" | Lets the ETL pick up where it stopped. Stored in MySQL, so any machine can run it. |
 
-**Why dim tables instead of embedding names in the fact table?** Keeps the fact
-table narrow (just IDs + the event), avoids repeating a dashboard's title on every
-one of its thousands of view rows, and lets a title/owner change propagate without
-rewriting history -- standard star-schema reasoning, appropriate here because the
-usage dashboard's whole job (now a native Superset dashboard rather than a
-standalone app, but same underlying MySQL tables) is human-readable ranking, not
-raw ID lists.
+Two choices worth knowing:
 
-**Errors (`fact_error_events`)**: failures are kept out of `fact_access_events`
-(which counts every `load_chart` as a view) and recorded in their own table with a
-`source` (`browser` = the client-side `load_chart` row with `has_err`; `gunicorn` =
-the arbiter's `WORKER TIMEOUT` line from container stdout) and a human-readable
-`reason`. Two sources because neither is complete: the browser knows the user and
-chart but only that it timed out; gunicorn knows why but not who. `dedupe_key` keeps
-re-ingestion idempotent.
+- **Dashboard views and chart views are separate rows.** "Most visited dashboards"
+  counts dashboard views only. Otherwise a 10-chart dashboard would look 10x more
+  popular than a 1-chart one.
+- **Repeat views are not merged.** A user refreshing is real activity. Instead the
+  usage dashboard shows total views *and* unique viewers, so "one person refreshing"
+  and "20 people looking once" are easy to tell apart.
 
-**High-water-mark table (`etl_sync_state`)**: a single dedicated table rather than
-a local file, so the ETL is safe to run from any container/host/scheduler
-instance without needing shared local disk -- state lives in the same MySQL
-instance the data lands in, and advances only after a batch is committed.
+## 2. Running the ETL in production
 
-## 2. ETL scheduling and monitoring in production
+`etl/sync_logs.py` does one bounded run and exits. A failed run does not move the
+"how far did we get" marker, so the next run simply retries the same data.
 
-The script (`etl/sync_logs.py`) is intentionally a single bounded run, not a
-long-lived loop -- this makes it trivial to schedule with any external
-orchestrator and to reason about failure (a failed run just doesn't advance the
-high-water-mark; the next scheduled run picks up from the same point).
+- **This lab:** cron every 10 minutes, calling `access-log-pipeline/run_etl.sh`.
+- **Production, simple:** a Kubernetes `CronJob` with `concurrencyPolicy: Forbid`
+  (so two runs never overlap) and an alert when a job fails.
+- **Production, bigger:** an Airflow DAG, for retries, alerts and run history.
+- **Alert on staleness too:** if `etl_sync_state.updated_at` stops moving, the
+  scheduler itself has stopped, even if no single run reported a failure.
 
-- **This sandbox**: cron, e.g. every 10 minutes (see README).
-- **Production, simple case**: a Kubernetes `CronJob` running the same container
-  image with `restartPolicy: OnFailure`, `concurrencyPolicy: Forbid` (so overlapping
-  runs can't race on the high-water-mark), and a `startingDeadlineSeconds` so a
-  missed run doesn't silently vanish. Alert on: job failure (via whatever the
-  cluster's CronJob-failure alerting is, e.g. a Prometheus `kube_job_status_failed`
-  rule), and staleness (`SELECT TIMESTAMPDIFF(MINUTE, updated_at, NOW()) FROM
-  etl_sync_state` exceeding N intervals means the scheduler itself stopped firing,
-  not just that one run failed).
-- **Production, more orchestration**: an Airflow DAG with a single task running
-  this script (or a thin wrapper), so failures get Airflow's retry/backoff,
-  SLA-miss alerting, and a visible run history/log per execution out of the box --
-  worth it once there are other pipelines this needs to coordinate with (e.g. "run
-  after the nightly Superset metadata backup").
-- Either way: emit a simple run summary (rows staged, rows inserted, final
-  high-water-mark) to whatever the org's log aggregation is -- the script already
-  prints this to stdout, so a CronJob/Airflow task just needs its logs shipped
-  normally.
+## 3. The intermittent chart timeout
 
-## 3. Task 2 root cause and recommended production fix
+**What happens.** A chart query takes longer than gunicorn's `timeout`
+(15s here). The gunicorn master then kills the whole worker process with SIGKILL.
+That happens outside Superset's code, so Superset never gets to log the request.
+The user just sees an error.
 
-**Root cause**: gunicorn's own worker `timeout` setting is what actually kills a
-request that runs too long -- and it does so by SIGKILLing the whole worker
-*process* from the arbiter, not by raising an exception inside it. That happens
-completely outside Superset's / Flask's control flow: no exception handler in the
-chart-data view runs, so `logging.exception()` never fires and Superset's
-`EVENT_LOGGER` never gets a chance to write a `logs` row for the failed request.
-The browser sees the connection drop or a generic 5xx from nowhere; app-level logs
-(and the `logs` table, which is what our own pipeline reads from!) show nothing
-useful -- at best a terse arbiter line in a different log stream that nobody was
-watching. This is exactly the "intermittent, unreproducible, invisible to logs"
-signature described in the ticket, and it reproduces reliably any time a query
-takes longer than `SUPERSET_WEBSERVER_TIMEOUT` / the gunicorn `timeout` -- **with
-one important precondition**: gunicorn's `timeout` only actually protects against
-this if `worker_class = "sync"` (the default). With `worker_class = "gthread"`
-(tried first in this lab), the worker's main event loop calls the arbiter's
-`notify()` heartbeat on every iteration of its own accept/select loop, completely
-independent of whether a pooled request-handling thread is stuck in a slow query --
-so the arbiter never sees the worker go stale, `timeout` silently stops doing
-anything, and the "before" repro just returns a slow-but-successful response
-instead of reproducing the bug. `docker/superset/gunicorn_config.py` uses `sync`
-for exactly this reason.
+**Where the error shows up, and where it does not (checked in this lab):**
 
-**What actually lands in the logs (verified)**: the only server-side trace is the
-arbiter's `[CRITICAL] WORKER TIMEOUT` / `[ERROR] ... SIGKILL` pair in container
-stdout (the "Perhaps out of memory?" text is gunicorn boilerplate, not a real OOM).
-Superset's `logs` table has **no row** for the killed chart-data request. The one
-exception is a *client-side* `load_chart` event the browser posts afterwards
-(`action = 'log'`, `json.has_err = true`, `json.error_details = "timeout"`,
-`duration` ~ the gunicorn timeout). It exists only if the browser tab survives long
-enough to flush it, so it is not a reliable record.
+| Place | Visible? |
+|---|---|
+| Container output (`docker compose logs superset`) | Yes: `WORKER TIMEOUT` then `SIGKILL`. The "out of memory?" text is gunicorn boilerplate, not a real OOM. |
+| Superset's `logs` table, server side | No row for the killed request. |
+| Superset's `logs` table, browser side | Sometimes: a `load_chart` row with `has_err = true` and `timeout`, but only if the browser tab survives long enough to send it. |
+| The MySQL pipeline | It reads the `logs` table, so it misses the server side too. The browser row is even counted as a normal `chart_view`. |
 
-**Recommended fix, in priority order**:
+**Why it is "intermittent": the cache.** Query results are cached in Redis for 300s.
+A killed request never writes a result, so a cold load always fails. If anything
+else finishes the same query (another session, a warm-up job), the next load is
+served from cache and works until the cache expires. So the same dashboard fails,
+then works after a refresh, then fails again later.
 
-1. **Align timeouts so the database fails first, loudly.** Set a
-   `statement_timeout` (Postgres) / equivalent on each registered database
-   connection, tuned shorter than the webserver timeout. This turns "worker gets
-   killed with no trace" into "query gets cancelled by the DB, Superset's view
-   function catches a real `OperationalError`/`QueryCanceled`, logs it, and
-   returns a real (if still unfriendly) error to the user." This is fix #1,
-   implemented in `intermittent-error/fix/apply_fix.py`.
-2. **Add a server-side watchdog independent of app logging**, for the cases the
-   DB-side fix can't cover (e.g. a genuinely slow non-DB computation, a hung
-   network call to some other service). Gunicorn's `worker_abort` hook
-   (`docker/superset/gunicorn_config.py`) is *intended* to fire on the worker
-   process right before it's killed and log the request path + how long it had
-   been running, on the theory that it's the one hook gunicorn still calls even
-   when app code has lost control. **Caveat found while validating this repro**:
-   that theory only holds if the worker is blocked somewhere that still yields to
-   the interpreter's signal handling. When it's blocked inside a synchronous
-   C-level call (e.g. `psycopg2` executing a query, as in this repro's own DB
-   timeout), the arbiter's `SIGABRT` (which should trigger the hook) can't be
-   handled until the call returns -- and by then `SIGKILL` has already landed on
-   the arbiter's next sweep, ~1s later. Confirmed empirically: the captured
-   "before" logs show `[CRITICAL] WORKER TIMEOUT` directly followed by
-   `[ERROR] ... sent SIGKILL`, with no `WORKER_ABORT` line from the hook in
-   between. So this watchdog is real defense-in-depth for a hung *Python-level*
-   computation, but not for a hung synchronous DB driver call -- which is
-   precisely the failure mode fix #1 already targets. A more complete version of
-   this watchdog would run the blocking call in a separate thread so the main
-   worker thread stays responsive to signals -- not implemented here.
-3. **(Not implemented here, noted as further work)** a frontend-side reporting
-   hook: Superset's chart components already know when a fetch fails or never
-   resolves; wiring that to POST a small "client observed a failed/timed-out chart
-   load" event to a logging endpoint would catch failures that never even reach
-   the backend in a loggable way at all (e.g. the connection dropping before any
-   response, a CDN/proxy timeout in front of Superset). Lower priority than #1/#2
-   here because #1 addresses the actual reported root cause; a frontend hook is a
-   good defense-in-depth addition, not the fix for *this* bug.
+**Making our pipeline record it.** `fact_error_events` is filled from two sources,
+because neither is complete on its own:
 
-**What's different in this sandbox vs. real prod, and what to check there**: this
-lab has no reverse proxy or load balancer in front of Superset -- the client talks
-to gunicorn directly. A real deployment almost always has one (nginx, an ALB/ELB,
-an ingress controller), and that layer has **its own** timeout, which must also be
-longer than the webserver timeout for this fix to actually surface an error
-instead of just moving the silent-kill point one layer out (e.g. nginx's
-`proxy_read_timeout`, an ALB's idle timeout, or an ingress controller's
-`proxy-read-timeout` annotation). Before applying this fix's timeout values in a
-real environment: enumerate every hop between the browser and gunicorn, and order
-their timeouts strictly increasing from database -> gunicorn -> any internal
-proxy -> the outermost load balancer/CDN, so whichever layer fails first is always
-the *database*, which is the only layer in this chain that reliably produces a
-catchable, loggable exception rather than a raw connection kill.
+- `browser`: knows the user, dashboard and chart, but only that it "timed out".
+- `gunicorn`: knows the real reason (worker killed at the timeout), but not who.
+  Match the two by timestamp (usually 1-2 seconds apart).
 
-## 4. Two ETL correctness bugs found (and fixed) while verifying the usage dashboard end-to-end
+`fact_access_events` is left as is, so a failed load still counts as a view there.
+That is deliberate: it shows why the usage table alone cannot be trusted for errors.
 
-Standing up the pipeline and checking the dashboard *looked* fine in isolation,
-but driving real traffic through it end-to-end (seed data -> ETL -> dashboard,
-then real browser clicks -> ETL -> dashboard) surfaced two real bugs in
-`etl/sync_logs.py`'s incremental sync, both now fixed:
+**The real fix (not applied in the demo).**
 
-**Bug 1 -- the `dttm`-based watermark could advance into the future.**
-`LogRestApi` doesn't support filtering/ordering by `id`, so the incremental sync
-has to use `dttm > last_synced_ts` as its high-water-mark (see the comment in
-`fetch_log_pages`). `seed/generate_activity.py`'s `random_timestamp()` picks a
-random hour (7am-8pm) without clamping to the actual current time, so a seeded row
-can land *later in the day* than when the seed script actually ran. Once such a
-row advances the watermark, it sits ahead of real wall-clock time -- and every
-*real* event logged before that time of day (including genuine admin/user
-dashboard views) falls below the watermark and is silently, permanently excluded
-by the `>` filter. Symptom: re-running the ETL after real usage reports `0 raw
-rows staged, 0 fact rows inserted` indefinitely, even though new activity clearly
-exists in Superset's own `logs` table. **Fix**: cap the persisted watermark at
-`min(max_dttm_seen, now())` (`_parse_dttm` + the clamp at the end of `run()`) --
-a future-dated row still gets ingested in the run that sees it, it just can't push
-the *watermark* ahead of real time, so later real events stay visible to the
-`>` filter.
+1. **Make the database fail first.** Set a Postgres `statement_timeout` *shorter*
+   than the gunicorn timeout. The DB cancels the query, Superset catches the
+   error, logs it and shows a proper message (`fix/apply_fix.py`).
+2. **Order every timeout** from inside out: database, gunicorn, any proxy or load
+   balancer (nginx, ALB, ingress), CDN. The database must always be the one to fail
+   first, because it is the only layer that produces an error Superset can log.
+   This lab has no proxy; production almost always does.
+3. **Optional extras:** a gunicorn `worker_abort` hook (see the caveat below) and a
+   browser-side error report.
 
-**Bug 2 -- `ACTION_MAP` didn't recognize Superset's real frontend event names.**
-The seed script writes rows shaped like Superset's logging docs describe
-(`action = 'dashboard_load'` / `'chart_data'`), and `ACTION_MAP` was built to
-match that. Superset 4.1.4's actual frontend logging pipeline doesn't write those
-literal strings for organic browser usage, though -- it POSTs a generic
-`action = 'log'` row and nests the real event under `json.event_name`
-(`mount_dashboard`, `load_chart`, `force_refresh_chart`, confirmed by inspecting
-real rows in Postgres after clicking around the dashboard). Since `ACTION_MAP`
-only matched the top-level `action` column, **genuine usage was never being
-counted into `fact_access_events` at all** -- independent of bug 1, and much
-easier to miss, since the seeded demo data made the dashboard look populated and
-"working." **Fix**: `_classify_action()` now also unpacks `json.event_name` for
-generic `action = 'log'` rows via `LOG_EVENT_NAME_MAP`, so both the seeded demo
-traffic and real organic usage land in the fact table with the same semantics.
+**Two things that surprised us.**
 
-Verified fixed end-to-end: after both fixes, a single real dashboard page load in
-the browser, followed by one incremental `etl/sync_logs.py` run, moved
-`fact_access_events`'s `dashboard_view` count by exactly +1 and was visible on the
-"Superset Usage Analytics" dashboard after a cache flush/refresh.
+- gunicorn's `timeout` only works with `worker_class = "sync"`. With `gthread` the
+  worker keeps reporting "alive" while a request thread is stuck, so the timeout
+  never fires and the bug does not reproduce. The lab uses `sync`.
+- The `worker_abort` hook never ran. gunicorn sends SIGABRT first, but the worker is
+  stuck inside the database driver (native code) and cannot handle the signal before
+  SIGKILL arrives about a second later. So that hook helps for stuck Python code,
+  not for a stuck DB call.
 
-## 5. Simulating the "error, then fine after refresh" variant (cache-driven)
+**Reproducing the "error, then fine after refresh" version** (what the demo uses):
 
-In practice the timeout often disappears on refresh. The cause is the data cache
-(`CACHE_CONFIG` / `DATA_CACHE_CONFIG`, Redis db 2, 300s TTL): a request killed at the
-gunicorn timeout never writes a result, so a cold load always fails, but if something
-else completes the same query (a path with no 15s limit, a Celery/warm-up job, another
-session) the result is cached and the next load is instant until the TTL expires. That
-is the intermittent behaviour: it depends on cache state, not on the query.
+The query must take longer than gunicorn's timeout but shorter than the DB's. Here:
+15s gunicorn < **18s query** < 20s DB `statement_timeout`.
 
-**Timing constraint**: the slow query must sit *between* the two limits. The DB
-`statement_timeout` (20s, from `fix/apply_fix.py`) is lower than a `pg_sleep(45)`
-query, so with the original 45s sleep even a no-timeout server cancels the query and
-caches nothing. The lab now uses `SLOW_QUERY_SLEEP_SECONDS=18`: above the 15s gunicorn
-timeout (port 8089 fails) and below the 20s DB timeout (a no-limit server succeeds).
-
-**Steps** (verified working):
-1. Flush only the cache: `docker compose exec redis redis-cli -n 2 FLUSHDB`
-   (db 2 only, so the Celery broker is untouched).
-2. Start a Superset with no gunicorn limit on the same Redis/DB:
+1. Clear the cache: `docker compose exec redis redis-cli -n 2 FLUSHDB`
+2. Start a Superset with no gunicorn limit:
    `docker compose run -d --name superset-nolimit -p 8090:8088 superset superset run -h 0.0.0.0 -p 8088 --with-threads`
-3. Load the dashboard on `localhost:8089` -> times out at ~15s (cold cache).
-4. Load it on `localhost:8090` -> succeeds at ~18s and populates the cache.
-5. Refresh `localhost:8089` -> instant, served from cache. After 300s the error returns.
-6. Clean up: `docker rm -f superset-nolimit`.
+3. Load the dashboard on `localhost:8089`: it times out at about 15s.
+4. Load it on `localhost:8090`: it succeeds at about 18s and fills the cache.
+5. Refresh `localhost:8089`: instant. After 300s the error comes back.
+6. Clean up: `docker rm -f superset-nolimit`
+
+## 4. Two ETL bugs we found and fixed
+
+Both only appeared when we pushed real browser traffic through the pipeline; the
+seeded demo data hid them.
+
+**Bug 1: the marker could jump into the future.** The ETL remembers progress by
+timestamp. The seed script created some events later in the day than the actual
+time. Once one of those became the marker, every real event before that time of day
+was skipped forever (symptom: "0 rows staged" even though Superset had new
+activity). *Fix:* the marker is never set later than the current time.
+
+**Bug 2: real clicks were not being counted.** The seed script writes rows like
+`action = 'dashboard_load'`. Superset 4.1.4's browser actually writes a generic
+`action = 'log'` row and puts the real event name (`mount_dashboard`, `load_chart`,
+`force_refresh_chart`) inside its JSON. The ETL only checked `action`, so genuine
+usage was never counted, and the seeded data made the dashboard look healthy.
+*Fix:* the ETL also reads `json.event_name`.
+
+After both fixes, one real dashboard load followed by one ETL run raised the
+`dashboard_view` count by exactly 1.
+
+## 5. Known gaps
+
+- `source_ip` is always empty: Superset's log model does not record the client IP.
+- The gunicorn error lines have no user, dashboard or chart (only a worker id and a
+  time), so they can only be matched to browser errors by timestamp.
+- The browser error row exists only if the tab stays open long enough to send it.
+- Superset 4.1.4 is pinned. Re-check the log event names if you upgrade.
