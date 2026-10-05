@@ -102,6 +102,24 @@ WHERE COALESCE(v.view_count, 0) <= 1
 ORDER BY view_count ASC, d.title ASC
 """.strip()
 
+# Failures recorded by etl/sync_logs.py (browser) and etl/ingest_container_errors.py
+# (gunicorn). Shown newest first with the dashboard title and username resolved.
+CHART_ERRORS_SQL = """
+SELECT
+    e.event_ts AS event_ts,
+    e.source AS source,
+    e.error_type AS error_type,
+    COALESCE(d.title, '') AS dashboard,
+    e.chart_id AS chart_id,
+    COALESCE(u.username, '') AS username,
+    e.duration_ms AS duration_ms,
+    e.reason AS reason
+FROM fact_error_events e
+LEFT JOIN dim_dashboards d ON d.dashboard_id = e.dashboard_id
+LEFT JOIN dim_users u ON u.user_id = e.user_id
+ORDER BY e.event_ts DESC
+""".strip()
+
 # Explicit column fallback for the virtual datasets above -- see
 # _ensure_virtual_dataset_columns() for why this is needed (Superset's virtual
 # dataset column introspection silently returns no columns when the probe query
@@ -219,6 +237,16 @@ def _ensure_virtual_dataset_columns(client, dataset_id, table_name, column_defs)
         f"{client.base_url}/api/v1/dataset/{dataset_id}", json=payload, timeout=60
     ).raise_for_status()
     print(f"explicitly set columns for '{table_name}' (id={dataset_id}) -- refresh returned none")
+CHART_ERRORS_COLUMNS = [
+    ("event_ts", "DATETIME", True),
+    ("source", "VARCHAR(20)", False),
+    ("error_type", "VARCHAR(50)", False),
+    ("dashboard", "VARCHAR(500)", False),
+    ("chart_id", "INT", False),
+    ("username", "VARCHAR(255)", False),
+    ("duration_ms", "INT", False),
+    ("reason", "VARCHAR(500)", False),
+]
 
 
 def get_or_create_dataset(client, db_id, table_name, sql=None, column_defs=None):
@@ -426,6 +454,30 @@ def zero_view_dashboards_params(dataset_id):
     return p
 
 
+def chart_errors_params(dataset_id):
+    p = _base_params(dataset_id, "table")
+    p.update(
+        {
+            "query_mode": "raw",
+            "all_columns": [
+                "event_ts",
+                "source",
+                "error_type",
+                "dashboard",
+                "chart_id",
+                "username",
+                "duration_ms",
+                "reason",
+            ],
+            "order_by_cols": ['["event_ts", false]'],
+            "row_limit": 100,
+            "server_pagination": False,
+            "time_range": "No filter",
+        }
+    )
+    return p
+
+
 def export_activity_params(dataset_id):
     p = _base_params(dataset_id, "table")
     p.update(
@@ -479,6 +531,11 @@ def main():
         sql=ZERO_VIEW_DASHBOARDS_SQL, column_defs=ZERO_VIEW_DASHBOARDS_COLUMNS,
     )
 
+    chart_errors_id = get_or_create_dataset(
+        client, db_id, "vw_chart_errors",
+        sql=CHART_ERRORS_SQL, column_defs=CHART_ERRORS_COLUMNS,
+    )
+
     dashboard_id = get_or_create_dashboard(client, DASHBOARD_TITLE)
 
     get_or_create_chart(
@@ -508,6 +565,10 @@ def main():
     get_or_create_chart(
         client, "Export Activity", fact_id, "table",
         export_activity_params(fact_id), dashboard_id,
+    )
+    get_or_create_chart(
+        client, "Chart Load Errors", chart_errors_id, "table",
+        chart_errors_params(chart_errors_id), dashboard_id,
     )
 
     print(

@@ -51,12 +51,16 @@ CACHE_CONFIG = {
     "CACHE_TYPE": "RedisCache",
     # seconds a cached chart result is reused; set CACHE_TIMEOUT_SECONDS in .env
     "CACHE_DEFAULT_TIMEOUT": int(os.environ.get("CACHE_TIMEOUT_SECONDS", "300")),
-    "CACHE_KEY_PREFIX": "superset_",
+    # Metadata cache (includes the page bootstrap data, which carries the browser's
+    # request timeout). The no-limit demo server sets its own CACHE_KEY_PREFIX so it
+    # does not read the main server's cached 15 s timeout.
+    "CACHE_KEY_PREFIX": os.environ.get("CACHE_KEY_PREFIX", "superset_"),
     "CACHE_REDIS_HOST": REDIS_HOST,
     "CACHE_REDIS_PORT": REDIS_PORT,
     "CACHE_REDIS_DB": 2,
 }
-DATA_CACHE_CONFIG = CACHE_CONFIG
+# Chart results keep one fixed prefix so every server shares them.
+DATA_CACHE_CONFIG = {**CACHE_CONFIG, "CACHE_KEY_PREFIX": "superset_data_"}
 
 # --- Event logging (TASK 1: this is the source our ETL pulls from via /api/v1/log/) ---
 # DBEventLogger is Superset's built-in logger that writes every logged action

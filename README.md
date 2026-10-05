@@ -64,7 +64,7 @@ docker compose logs -f superset-init
 Once `superset-init` is done and the webserver is accepting connections,
 `superset-bootstrap` runs automatically: it registers the pipeline's MySQL
 database as a Superset connection, registers the relevant tables as Superset
-datasets, and creates the native **Superset Usage Analytics** dashboard + its 7
+datasets, and creates the native **Superset Usage Analytics** dashboard + its 8
 charts (see `access-log-pipeline/superset_bootstrap/bootstrap_dashboard.py`).
 It's idempotent -- safe to re-run (`docker compose run --rm superset-bootstrap`)
 any time. Watch it with:
@@ -112,7 +112,7 @@ Re-run it any time -- it's idempotent (tracks a high-water-mark in
 **View the usage dashboard**: log into Superset at http://localhost:8089
 (admin/admin) and open **Dashboards -> Superset Usage Analytics**. It's a native
 Superset dashboard, auto-provisioned by `superset-bootstrap` against the same
-MySQL tables the ETL writes to, with 7 charts:
+MySQL tables the ETL writes to, with 8 charts:
 
 - **Total Dashboard Views** / **Active Users** -- headline KPI numbers.
 - **Most Viewed Dashboards** -- ranked table (view count + unique viewers per
@@ -121,6 +121,7 @@ MySQL tables the ETL writes to, with 7 charts:
 - **User Activity** -- per-user view/chart-view counts and last-active time.
 - **Zero-View Dashboards** -- near-zero-views list (deprecation candidates).
 - **Export Activity** -- `export_csv` / `export_excel` counts.
+- **Chart Load Errors** -- failed chart loads from `fact_error_events` (time, source, dashboard, chart, user, reason).
 
 Since these are ordinary Superset charts, you get Superset's native dashboard
 time-range filter, drill-downs, and export-to-CSV for free -- no separate service
