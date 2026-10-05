@@ -86,3 +86,42 @@ PREVENT_UNSAFE_DB_CONNECTIONS = False
 SUPERSET_WEBSERVER_TIMEOUT = int(os.environ.get("SUPERSET_WEBSERVER_TIMEOUT", "15"))
 SQLLAB_TIMEOUT = int(os.environ.get("SQLLAB_TIMEOUT", "15"))
 SUPERSET_WEBSERVER_TIMEOUT_PATH = None
+
+
+# --- Request trace: lets us say WHO/WHAT a gunicorn "WORKER TIMEOUT" belonged to ---
+# gunicorn's own timeout line only carries the worker pid and a time. Each worker
+# therefore logs one line per request as it starts: its pid, the user, and the URL
+# (the chart-data URL already contains slice_id and dashboard_id). The ETL
+# (etl/ingest_container_errors.py) joins the timeout line's pid to the last trace
+# line of that same pid. Logged on request START on purpose: a killed request never
+# reaches any "end of request" hook.
+def FLASK_APP_MUTATOR(app):
+    import logging
+    import sys
+    import time
+
+    from flask import request
+    from flask_login import current_user
+
+    tracer = logging.getLogger("reqtrace")
+    tracer.setLevel(logging.INFO)
+    tracer.propagate = False
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    tracer.addHandler(handler)
+
+    skip = ("/health", "/static/", "/superset/log", "/api/v1/me", "/api/v1/log")
+
+    @app.before_request
+    def _trace_request():
+        try:
+            if request.path.startswith(skip):
+                return
+            user = current_user.get_id() if current_user.is_authenticated else "-"
+            tracer.info(
+                "REQTRACE ts=%s pid=%s user=%s method=%s url=%s",
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
+                os.getpid(), user, request.method, request.full_path,
+            )
+        except Exception:  # tracing must never break a request
+            pass

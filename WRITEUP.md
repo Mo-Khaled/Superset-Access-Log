@@ -62,8 +62,10 @@ then works after a refresh, then fails again later.
 because neither is complete on its own:
 
 - `browser`: knows the user, dashboard and chart, but only that it "timed out".
-- `gunicorn`: knows the real reason (worker killed at the timeout), but not who.
-  Match the two by timestamp (usually 1-2 seconds apart).
+- `gunicorn`: knows the real reason (worker killed at the timeout). The timeout line
+  itself has only a worker id, so each worker also logs a `REQTRACE` line (pid, user,
+  URL) when a request starts. The ingest joins the timeout to that pid's last trace
+  line and fills in the user, dashboard and chart.
 
 `fact_access_events` is left as is, so a failed load still counts as a view there.
 That is deliberate: it shows why the usage table alone cannot be trusted for errors.
@@ -127,7 +129,8 @@ After both fixes, one real dashboard load followed by one ETL run raised the
 ## 5. Known gaps
 
 - `source_ip` is always empty: Superset's log model does not record the client IP.
-- The gunicorn error lines have no user, dashboard or chart (only a worker id and a
-  time), so they can only be matched to browser errors by timestamp.
+- The user/dashboard/chart on gunicorn rows comes from the `REQTRACE` line, so it only
+  exists for timeouts that happened after the trace was added to `superset_config.py`.
+  Requests made with an API token (not a browser session) are traced with `user=-`.
 - The browser error row exists only if the tab stays open long enough to send it.
 - Superset 4.1.4 is pinned. Re-check the log event names if you upgrade.

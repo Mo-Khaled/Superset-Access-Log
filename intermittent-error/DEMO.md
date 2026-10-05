@@ -28,7 +28,8 @@ gunicorn timeout is 15s, DB statement_timeout is 20s.
      (`select action, count(*) from fact_access_events where chart_id=204 group by action;`).
    - `fact_error_events`: the failure is logged with its reason: a `browser` row
      (user/dashboard/chart + "timeout after ~15000 ms") and a `gunicorn` row
-     ("worker pid N exceeded the 15s request timeout and was SIGKILLed").
+     ("worker pid N exceeded the 15s request timeout and was SIGKILLed; request was POST /api/v1/chart/data")
+     with the same user/dashboard/chart, joined through the worker pid..
 4. Open `localhost:8090` dashboard (~18s, succeeds, fills the cache).
 5. Refresh `localhost:8089` -> loads instantly. **Intermittent.**
 6. After 5 min the cache expires and the error returns.

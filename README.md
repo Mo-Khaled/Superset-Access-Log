@@ -155,8 +155,11 @@ Failures and their reasons go to `fact_error_events` instead, from two sources:
 - `browser`: `load_chart` rows in Superset's `logs` table with `has_err = true`
   (user, dashboard, chart, error such as `timeout`, duration).
 - `gunicorn`: `WORKER TIMEOUT` lines from the superset container's stdout, the only
-  server-side trace of a request killed by the gunicorn timeout (reason, but no
-  user/dashboard/chart). Match the two by timestamp.
+  server-side trace of a request killed by the gunicorn timeout. Each worker also
+  logs a `REQTRACE` line (pid, user, URL) per request (`FLASK_APP_MUTATOR` in
+  `docker/superset/superset_config.py`); the ingest joins the two on the worker pid
+  to add user, dashboard and chart. After changing that config, rebuild:
+  `docker compose up -d --build superset superset-worker superset-worker-beat`.
 
 ```bash
 # schema is auto-applied on a fresh mysql volume; on an existing one:
