@@ -11,7 +11,7 @@ Superset's activity is pulled through `LogRestApi` into MySQL like this:
 |---|---|---|
 | `raw_log_landing` | The untouched JSON of every Superset log row | Superset may delete old logs. With a raw copy we can rebuild the other tables later if we find a bug or want a new metric. |
 | `fact_access_events` | One row per dashboard view, chart view or export | The usage numbers. |
-| `fact_error_events` | One row per failure, with its reason | See section 3. |
+| `fact_error_events` | One row per failure, with its reason | See sections 3 and 5. Lives in Iceberg when the sink is on. |
 | `dim_users`, `dim_dashboards` | Names and owners | Keeps the fact table small and lets a renamed dashboard show its new title everywhere. |
 | `etl_sync_state` | "How far did we get last time" | Lets the ETL pick up where it stopped. Stored in MySQL, so any machine can run it. |
 
@@ -124,10 +124,10 @@ The query must take longer than gunicorn's timeout but shorter than the DB's. He
 5. Refresh `localhost:8089`: instant. After 300s the error comes back.
 6. Clean up: `docker rm -f superset-nolimit`
 
-## 4. Two ETL bugs we found and fixed
+## 4. Three ETL bugs we found and fixed
 
-Both only appeared when we pushed real browser traffic through the pipeline; the
-seeded demo data hid them.
+The first two only appeared when we pushed real browser traffic through the pipeline; the
+seeded demo data hid them. The third showed up when a second seed run was only partly read.
 
 **Bug 1: the marker could jump into the future.** The ETL remembers progress by
 timestamp. The seed script created some events later in the day than the actual
@@ -145,7 +145,83 @@ usage was never counted, and the seeded data made the dashboard look healthy.
 After both fixes, one real dashboard load followed by one ETL run raised the
 `dashboard_view` count by exactly 1.
 
-## 5. Known gaps
+**Bug 3: rows dated in the past were skipped for good.** The ETL asks Superset for rows with `dttm > watermark`,
+because the log API cannot filter by id. Capping the watermark at the current time (bug 1) stopped the future-date
+problem, but it does nothing for a row that is inserted *after* the watermark moves and carries an *older* `dttm`.
+That row never matches the filter again. We hit it: a second seed run inserted 7,225 rows and the ETL read 221. In real
+life the same thing happens with late browser flushes, clock skew between workers, ETL downtime and backfills.
+*Fix, three layers (all safe to repeat, because MySQL uses INSERT IGNORE and Iceberg uses MERGE):*
+1. **Lookback.** Every pull starts 24 hours (configurable) before the watermark.
+2. **Reconciliation.** After a pull, the number of rows Superset dated before the start of the run (the `count` field of
+   the list API with a `dttm` filter) is compared with the same window in `raw_log_landing`. If Superset has more, the
+   whole log is re-pulled once and a warning with the gap is printed. A fixed window is essential: every API call the ETL
+   makes is itself logged by Superset (about 50 rows per run), so a total count hid a few missing rows. Real numbers from
+   testing: the first reconciliation run found 6,909 skipped rows, and after a second seed 6,808.
+3. **`--since` / `--full`** for a deliberate backfill.
+
+The seed script also stopped generating timestamps later than now, which was the original cause. The watermark moves
+only after every write, including the Iceberg write, has succeeded. `tests/acceptance_watermark.py` checks a row dated
+3 hours ago, one 10 days ago, one tomorrow, an idempotent re-run, and that nothing is missing.
+
+A trap to remember: Superset 4.1.4's log list API silently ignores the filter operators `lte`, `le`, `gte` and `ge`
+and returns everything; only `lt` and `gt` filter. A first version of the reconciliation used `lte` and reported a
+gap that did not exist, until the counts were compared with Postgres directly.
+
+## 5. Failure rate and load time in Iceberg
+
+**Goal.** Know how reliable and how fast each dashboard is, per day, week and month, without adding a component to the
+architecture. The bank already runs Iceberg and Trino, so the error data and the usage facts are written there and read back
+through Trino by Superset.
+
+**How it is built.**
+- The ETL writes with Trino SQL (`MERGE INTO`), so the pipeline needs no catalog or object-store credentials of its own.
+  A `MERGE ... WHEN NOT MATCHED` makes re-reading harmless, which Iceberg's lack of unique keys would otherwise prevent.
+- Rows are merged in chunks, one statement per table per chunk, not one per API page. Each MERGE is a snapshot, so many
+  small ones would mean many small files; compaction (`optimize`) is a scheduled production task.
+- One writer at a time: a MySQL advisory lock is shared by the ETL and the error ingest, because concurrent MERGEs conflict.
+- MySQL keeps what is small and mutable (raw copy, dimensions, the sync state, the existing usage facts). Errors and the
+  usage facts needed for the ratio live in Iceberg, partitioned by day.
+- For the lab, `lakehouse/` is a self-contained stand-in (MinIO, Iceberg REST catalog, Trino) with its own compose file. It is
+  not part of the target architecture.
+
+**Any error, not one known cause.** The first version only recognised the gunicorn timeout, which is the one cause
+this lab was built around. Production will fail in ways nobody predicted, so capture was generalised instead of adding
+a rule per cause:
+- Superset now logs every dashboard/chart request that ends in HTTP 400 or above, with the status, duration and the
+  message from the response, and every unhandled exception with its class. The ingest also reads gunicorn problems of
+  any kind (timeout, a worker killed from outside) and failed Celery tasks.
+- Every error row keeps the raw message, a coarse category, and a *signature*: the message with numbers, ids and quoted
+  values removed, so that "Columns missing in dataset: [a, b]" and "[c, d]" count as one error.
+- Anything the rules do not recognise is categorised `unclassified`, never dropped. A growing `unclassified` signature in
+  the Top Error Messages table is how a new cause is noticed, and one line in the classifier names it.
+- Tested with six different failures (two 404s, a 422, a 400 with a query message, a missing dataset, a killed worker)
+  through the same code path, plus a parser test covering a SIGKILL with no timeout, an unknown arbiter message and a
+  failed background task.
+
+**Metrics.**
+- *Failure rate* = failed chart loads / chart loads. An error is one failed chart load, so this keeps one unit on both
+  sides. Dividing by dashboard views would mix units (a dashboard view loads many charts) and can exceed 1.
+  It is computed as a ratio of sums so that week and month values weigh each day by its traffic.
+- *Load time* (average, p95) and *slow-load rate* use successful chart loads only. Percentiles cannot be rebuilt from daily
+  percentiles, so they are computed by Superset directly on the fact table at whatever time grain the chart uses.
+
+**How to read it, honestly.**
+- The failure rate is a **lower bound**. Failed loads are reported by the browser, and only while the tab stays open.
+  The `server_kills` column is gunicorn's own count of killed workers. When it is well above the failed loads, the browser is
+  under-reporting. Gunicorn rows are kept out of the numerator because they often cannot be tied to a dashboard and would
+  double count a failure the browser also reported.
+- Load times are measured in the browser, so they include network time.
+- Server errors and server kills are shown next to the failure rate but not added to it, because the browser can report
+  the same failure. A failure that leaves no trace in the browser event, a request error, a gunicorn line or a Celery
+  log cannot be seen at all.
+- The numbers are only as complete as Superset's own log. The reconciliation step makes missing rows visible, but rows
+  deleted by Superset's retention cannot be recovered.
+
+**Needs confirming in the bank's environment:** Trino version and catalog type, format-version 2 tables, the pipeline user's
+permissions, authentication and TLS, who owns compaction, and the slow-load threshold. The lab values are not assumptions
+about the bank.
+
+## 6. Known gaps
 
 - `source_ip` is always empty: Superset's log model does not record the client IP.
 - The user/dashboard/chart on gunicorn rows comes from the `REQTRACE` line, so it only
@@ -153,3 +229,6 @@ After both fixes, one real dashboard load followed by one ETL run raised the
   Requests made with an API token (not a browser session) are traced with `user=-`.
 - The browser error row exists only if the tab stays open long enough to send it.
 - Superset 4.1.4 is pinned. Re-check the log event names if you upgrade.
+- The failure rate under-counts (browser rows only exist while the tab is open); see section 5.
+- Container logs still reach the pipeline through a manual pipe. A log platform is the follow-up.
+- The Iceberg sink assumes a single writer; compaction and snapshot expiry are manual until someone owns them.

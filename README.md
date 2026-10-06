@@ -23,15 +23,22 @@ docker-compose.yml               top-level orchestration
 .env.example                     copy to .env (git-ignored) before first run
 docker/superset/                 custom Superset image (config, gunicorn config)
 docker/postgres/                 creates the separate "examples" DB on the same PG instance
+lakehouse/                       lab stand-in for the bank's Iceberg + Trino (own compose file, all images)
 access-log-pipeline/
   schema/                        MySQL DDL (auto-applied on first mysql container boot)
+  schema_iceberg/                Iceberg DDL (tables + failure-rate view), applied by etl/iceberg_init.py
   seed/generate_activity.py      simulates skewed multi-user dashboard traffic
-  etl/sync_logs.py               incremental Superset logs -> MySQL ETL (+ browser errors)
-  etl/ingest_container_errors.py gunicorn WORKER TIMEOUT lines -> fact_error_events
-  etl/backfill_browser_errors.py one-off: derive error rows from already-staged raw logs
+  etl/sync_logs.py               incremental Superset logs -> MySQL (+ Iceberg), with lookback + reconciliation
+  etl/iceberg_sink.py            batched MERGE into Iceberg through Trino
+  etl/iceberg_init.py            creates/verifies the Iceberg schema, tables (format-version 2) and view
+  etl/ingest_container_errors.py server-side failures of ANY cause from the container logs -> error table
+  etl/error_classify.py          cause-agnostic category + signature for any error message
+  etl/backfill_iceberg.py        one-off: copy existing history into Iceberg
+  tests/acceptance_watermark.py  proves past/future-dated rows are neither skipped nor counted wrongly
+  tests/test_error_classify.py   classifier checks;  tests/test_ingest_parse.py  container-log parser checks
   run_etl.sh                     one scheduled cycle (both ETL steps); what cron calls
   superset_client.py             shared Superset API auth helper
-  superset_bootstrap/            provisions the native Superset usage dashboard (DB conn, datasets, charts)
+  superset_bootstrap/            provisions the native Superset dashboards (usage; reliability and speed)
 intermittent-error/
   DEMO.md                        step-by-step demo of the intermittent, unlogged timeout
   repro/                         slow chart/dashboard, trigger, show_evidence.sh
@@ -121,7 +128,11 @@ MySQL tables the ETL writes to, with 8 charts:
 - **User Activity** -- per-user view/chart-view counts and last-active time.
 - **Zero-View Dashboards** -- near-zero-views list (deprecation candidates).
 - **Export Activity** -- `export_csv` / `export_excel` counts.
-- **Chart Load Errors** -- failed chart loads from `fact_error_events` (time, source, dashboard, chart, user, reason).
+- **Chart Load Errors** -- only without Iceberg (see below): failed chart loads from the MySQL `fact_error_events`.
+
+With the Iceberg sink on, a second dashboard, **Dashboard Reliability and Speed**, shows failure rate (daily, weekly,
+monthly), failed vs total chart loads, failure rate by dashboard, load time (average and p95), slow loads by
+dashboard, and **Chart Load Errors** (moved there).
 
 Since these are ordinary Superset charts, you get Superset's native dashboard
 time-range filter, drill-downs, and export-to-CSV for free -- no separate service
@@ -147,27 +158,131 @@ failure callback wired to Slack/PagerDuty) or a Kubernetes `CronJob` with
 `restartPolicy: OnFailure` plus a liveness/log-based alert if `etl_sync_state.
 updated_at` goes stale beyond N missed intervals. See `WRITEUP.md` for detail.
 
-### Errors table (`fact_error_events`)
+### Errors, failure rate and load time in Iceberg (queried through Trino)
 
-`fact_access_events` counts every `load_chart` as a `chart_view`, so a chart that
-failed to load looks like a normal view there (deliberate: it is a usage table).
-Failures and their reasons go to `fact_error_events` instead, from two sources:
+`fact_access_events` counts every `load_chart` as a `chart_view`, so a failed chart load looks like a normal view
+there (deliberate: it is a usage table). Failures and their reasons are stored separately, **in Iceberg**, together
+with a copy of the usage facts, so one engine can answer "how often do dashboards fail, and how fast are they?".
 
-- `browser`: `load_chart` rows in Superset's `logs` table with `has_err = true`
-  (user, dashboard, chart, error such as `timeout`, duration).
-- `gunicorn`: `WORKER TIMEOUT` lines from the superset container's stdout, the only
-  server-side trace of a request killed by the gunicorn timeout. Each worker also
-  logs a `REQTRACE` line (pid, user, URL) per request (`FLASK_APP_MUTATOR` in
-  `docker/superset/superset_config.py`); the ingest joins the two on the worker pid
-  to add user, dashboard and chart. After changing that config, rebuild:
-  `docker compose up -d --build superset superset-worker superset-worker-beat`.
+```
+Superset logs --LogRestApi--> ETL --+--> MySQL   raw_log_landing, dims, etl_sync_state, usage facts (unchanged)
+gunicorn lines (container log) -----+--> Iceberg (via Trino MERGE)  fact_access_events, fact_error_events, dim_dashboards
+                                                       |
+                                       Trino view vw_chart_failure_rate --> Superset "Dashboard Reliability and Speed"
+```
+
+| Iceberg object (`iceberg.monitoring`) | What it holds |
+|---|---|
+| `fact_access_events` | dashboard views, chart views, exports; `duration_ms` (browser-measured load time) and `is_error` |
+| `fact_error_events` | one row per failure: `source` = `browser` or `gunicorn`, `reason`, user, dashboard, chart |
+| `dim_dashboards` | dashboard titles |
+| `vw_chart_failure_rate` | per day and dashboard: `chart_loads`, `failed_loads`, `server_kills` (future-dated rows excluded) |
+
+#### Any error, whatever the cause
+
+In production the cause of a data error is not known in advance, so capture is not tied to one kind of failure.
+Every failure becomes a row with the **raw message** (never dropped), a coarse **category**, a **signature** (the
+message with numbers, ids and quoted values removed, so "the same error" groups together) and the HTTP status.
+
+| `source` | What it catches |
+|---|---|
+| `browser` | any `load_chart` event the browser reports as failed (`has_err`), with its own message |
+| `server` | any dashboard/chart request that ended with HTTP 400 or above: status, duration, the message in the response, plus the exception class for unhandled exceptions |
+| `gunicorn` | worker timeouts, workers killed from outside (SIGKILL/OOM) and any other arbiter error, tied to the request by worker pid |
+| `celery` | failed background tasks (`raised unexpected`) |
+
+Superset logs these through `FLASK_APP_MUTATOR` in `docker/superset/superset_config.py` (`REQTRACE` at request start,
+`REQEND` for error responses, `REQEXC` for unhandled exceptions). `ERROR_TRACE_PREFIXES` sets which paths count as
+dashboard/chart requests (default: charts, dashboards, explore, datasets, SQL Lab). The superset-worker log is read too.
+
+Categories: `timeout`, `worker_failure`, `connection`, `permission`, `query_error`, `not_found`, `rate_limit`,
+`data_error`, `client_error`, `server_error`, and **`unclassified`** for anything the rules do not recognise. That last
+one is the point: an unknown cause is stored and shows up, instead of being lost. Open **Top Error Messages** on the
+Reliability dashboard, look at the biggest `unclassified` or fastest-growing signature, and add a rule to
+`etl/error_classify.py` once you understand it. Existing rows are re-classified by `etl/backfill_iceberg.py`.
+
+Counting: the **failure rate** uses browser-reported failures of any category. **Server errors** and **server kills**
+are shown beside it, not added to it, because the browser may report the same failure and adding them would double
+count. Python `ERROR` log lines are not ingested separately for the same reason (the request hooks already capture
+them with more context); a failure that leaves no trace in any of these four places cannot be seen.
+
+**Metrics** (Superset applies its own time grain, so one definition serves day, week and month):
+
+- **Failure rate** = `SUM(failed_loads) / SUM(chart_loads)`: failed chart loads divided by chart loads (the same
+  unit on both sides). A ratio of sums, not an average of daily ratios, which would overweight quiet days.
+- **Load time** = average and p95 of the browser-measured load time of *successful* chart loads (a timeout always
+  reads about 15 s and would hide real slowness). **Slow-load rate** = share of successful loads above
+  `SLOW_LOAD_MS` (default 5000; agree the value with the business).
+
+**Read the failure rate as a lower bound.** Failed loads come from the browser, which only reports while the tab
+stays open. A user who closes the tab during a 15 s timeout leaves no browser row. `server_kills` (gunicorn's own count
+of killed workers) is shown next to it: a `server_kills` value well above `failed_loads` means the browser is
+under-reporting. Load times are measured in the browser, so they include network time.
+
+#### Run it in the lab (only the containers that are needed)
 
 ```bash
-# schema is auto-applied on a fresh mysql volume; on an existing one:
-docker compose exec -T mysql sh -c 'mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"'   < access-log-pipeline/schema/006_fact_error_events.sql
-# one-off, only if raw_log_landing already holds failures from before this table:
-docker compose exec -T pipeline python etl/backfill_browser_errors.py
+cp lakehouse/.env.example lakehouse/.env                      # first time only
+docker compose -f lakehouse/docker-compose.yml up -d          # minio, iceberg-rest, trino (+2 one-shot helpers)
+docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d --build \
+    postgres redis mysql superset pipeline                     # no worker, beat or bootstrap needed
+
+docker compose exec -T pipeline python etl/iceberg_init.py       # creates tables/view, checks format-version 2
+docker compose exec -T pipeline python etl/backfill_iceberg.py   # one-off: copy existing history
+bash access-log-pipeline/run_etl.sh                              # from now on, every cycle writes to Iceberg
+docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml run --rm superset-bootstrap   # the dashboard
+
+# ask Trino
+docker compose -f lakehouse/docker-compose.yml exec trino trino --execute "
+  select date_trunc('week', day) week, sum(chart_loads) loads, sum(failed_loads) failed,
+         round(sum(failed_loads) * 100.0 / nullif(sum(chart_loads), 0), 2) failure_pct
+  from iceberg.monitoring.vw_chart_failure_rate group by 1 order by 1"
 ```
+
+Against the bank's real Trino, do not use the `lakehouse/` files: set `ICEBERG_SINK_ENABLED=true` and the
+`TRINO_*` values in `.env` (and `TRINO_PASSWORD` for TLS/auth), then run the same `iceberg_init.py`.
+Without `ICEBERG_SINK_ENABLED` the stack works as before and errors go to the MySQL `fact_error_events` table.
+
+#### Past-dated rows are not skipped (watermark)
+
+LogRestApi cannot filter by id, so the ETL pulls rows with `dttm > watermark`. A row inserted later with an *older*
+`dttm` (late browser flush, clock skew, downtime, a backfill, the seed script) would never be seen. The ETL guards it:
+
+1. **Lookback**: each pull starts `ETL_LOOKBACK_HOURS` (default 24) before the watermark.
+2. **Reconciliation**: after the pull, the number of rows Superset dated before the start of the run is compared with
+   the same window in `raw_log_landing` (column `source_dttm`, added automatically). If Superset has more, the whole log
+   is re-pulled once and a `WARNING` with the gap is printed (idempotent). Comparing a fixed window matters: the ETL's own
+   API calls are logged by Superset, so a total count would hide a few missing rows.
+3. **`--since`**: `python etl/sync_logs.py --since '2026-09-01 00:00:00'` (or `--full`) for a deliberate backfill.
+4. The watermark never moves backwards or into the future, and **only moves after every write, including Iceberg,
+   succeeded**. A failed run is simply retried.
+5. The seed script no longer creates future-dated rows, and the view ignores any that exist.
+
+Trap found while building this: Superset 4.1.4's log list API **silently ignores** the filter operators `lte`, `le`,
+`gte` and `ge` and returns the unfiltered result. Only `lt` and `gt` filter. The ETL uses only those two.
+
+`python tests/acceptance_watermark.py` (inside the pipeline container) proves all of this.
+
+#### Operating notes
+
+- **Single writer.** Iceberg `MERGE` conflicts under concurrent writers. The ETL and the error ingest share a MySQL
+  advisory lock; a second concurrent run exits with a message. Keep one scheduler.
+- **Batching and small files.** Rows are merged in chunks (`ICEBERG_BATCH_ROWS`, default 2000), one statement per
+  table per chunk, not one per API page. Every `MERGE` is a snapshot, so schedule compaction in production:
+  `ALTER TABLE iceberg.monitoring.fact_access_events EXECUTE optimize;` (and `expire_snapshots`), weekly or when the
+  file count grows. Name an owner.
+- **MERGE needs format-version 2.** `iceberg_init.py` checks it and fails with a clear message otherwise.
+
+#### Still to confirm in the bank's environment
+
+Trino version (the lab runs 483); catalog type and storage; format-version 2 by default; permissions for the pipeline's
+Trino user (create schema/table, `MERGE`, `optimize`); authentication and TLS to Trino; compaction owner and schedule;
+whether the bank's Superset can use the same catalog and the `trino` SQLAlchemy driver; retention of Superset's
+`logs` table (limits how far a rescan can go); the slow-load threshold.
+
+**Follow-ups, deliberately out of scope:** shipping container logs from a log platform instead of the
+`docker compose logs` pipe; moving the existing Usage Analytics charts to Iceberg; dropping MySQL
+`fact_access_events` once nothing reads it.
 
 ### What `LogRestApi` does and doesn't capture
 

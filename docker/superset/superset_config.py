@@ -93,19 +93,27 @@ SQLLAB_TIMEOUT = int(os.environ.get("SQLLAB_TIMEOUT", "15"))
 SUPERSET_WEBSERVER_TIMEOUT_PATH = None
 
 
-# --- Request trace: lets us say WHO/WHAT a gunicorn "WORKER TIMEOUT" belonged to ---
-# gunicorn's own timeout line only carries the worker pid and a time. Each worker
-# therefore logs one line per request as it starts: its pid, the user, and the URL
-# (the chart-data URL already contains slice_id and dashboard_id). The ETL
-# (etl/ingest_container_errors.py) joins the timeout line's pid to the last trace
-# line of that same pid. Logged on request START on purpose: a killed request never
-# reaches any "end of request" hook.
+# --- Request trace: one log line per request event, so ANY failure can be explained, whatever its cause ---
+# We do not know in advance which errors production will produce, so nothing here is specific to one cause.
+# Each Superset worker writes these lines to stderr (the container log); etl/ingest_container_errors.py reads them:
+#
+#   REQTRACE  every request, when it STARTS (pid, user, id, url). A request killed by gunicorn never reaches the
+#             end-of-request hook, so this is the only record of who/what it was; the ETL joins gunicorn's
+#             "WORKER TIMEOUT (pid:N)" line to the last REQTRACE of that pid.
+#   REQEND    only requests that ended with an HTTP status >= 400 on a dashboard/chart path: status, duration and the
+#             error message from the response body. This catches query errors, permission errors, bad dashboards,
+#             bad datasets, anything Superset turns into an error response.
+#   REQEXC    unhandled exceptions: the exception class and message, tied to the request by its id.
+#
+# ERROR_TRACE_PREFIXES (comma separated) sets which paths REQEND watches; the default covers dashboards and charts.
 def FLASK_APP_MUTATOR(app):
     import logging
+    import re
     import sys
     import time
+    import uuid
 
-    from flask import request
+    from flask import g, got_request_exception, request
     from flask_login import current_user
 
     tracer = logging.getLogger("reqtrace")
@@ -116,17 +124,66 @@ def FLASK_APP_MUTATOR(app):
     tracer.addHandler(handler)
 
     skip = ("/health", "/static/", "/superset/log", "/api/v1/me", "/api/v1/log")
+    watch = tuple(
+        x.strip() for x in os.environ.get(
+            "ERROR_TRACE_PREFIXES",
+            "/api/v1/chart,/api/v1/dashboard,/api/v1/explore,/api/v1/dataset,/api/v1/sqllab,"
+            "/superset/dashboard,/superset/explore_json",
+        ).split(",") if x.strip()
+    )
+    space = re.compile(r"\s+")
+
+    def one_line(text, limit=300):
+        return space.sub(" ", str(text or "")).strip()[:limit]
+
+    def now():
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+    def user_id():
+        return current_user.get_id() if current_user.is_authenticated else "-"
 
     @app.before_request
     def _trace_request():
         try:
+            g._rid = uuid.uuid4().hex[:12]
+            g._t0 = time.time()
             if request.path.startswith(skip):
                 return
-            user = current_user.get_id() if current_user.is_authenticated else "-"
             tracer.info(
-                "REQTRACE ts=%s pid=%s user=%s method=%s url=%s",
-                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
-                os.getpid(), user, request.method, request.full_path,
+                "REQTRACE ts=%s pid=%s user=%s method=%s rid=%s url=%s",
+                now(), os.getpid(), user_id(), request.method, g._rid, request.full_path,
             )
         except Exception:  # tracing must never break a request
             pass
+
+    @app.after_request
+    def _trace_request_end(response):
+        try:
+            if response.status_code >= 400 and request.path.startswith(watch):
+                message = ""
+                body = response.get_json(silent=True) if response.is_json else None
+                if isinstance(body, dict):
+                    message = body.get("message") or body.get("error") or ""
+                    if not message and body.get("errors"):
+                        first = body["errors"][0]
+                        message = first.get("message") if isinstance(first, dict) else first
+                tracer.info(
+                    "REQEND ts=%s pid=%s user=%s method=%s rid=%s status=%s dur=%d url=%s msg=%s",
+                    now(), os.getpid(), user_id(), request.method, getattr(g, "_rid", "-"),
+                    response.status_code, int((time.time() - getattr(g, "_t0", time.time())) * 1000),
+                    request.full_path, one_line(message),
+                )
+        except Exception:
+            pass
+        return response
+
+    def _trace_exception(sender, exception, **extra):
+        try:
+            tracer.info(
+                "REQEXC ts=%s pid=%s rid=%s exc=%s msg=%s",
+                now(), os.getpid(), getattr(g, "_rid", "-"), type(exception).__name__, one_line(exception),
+            )
+        except Exception:
+            pass
+
+    got_request_exception.connect(_trace_exception, app)

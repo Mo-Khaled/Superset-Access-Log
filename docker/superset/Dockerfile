@@ -8,7 +8,8 @@ USER root
 # connect to the pipeline's MySQL analytics DB -- registered automatically by
 # superset_bootstrap/bootstrap_dashboard.py to power the native "Superset Usage
 # Analytics" dashboard (see access-log-pipeline/superset_bootstrap/).
-RUN pip install --no-cache-dir psycopg2-binary==2.9.9 pymysql==1.1.1
+# trino[sqlalchemy]: lets Superset query the Iceberg tables through Trino (error and access facts, failure rate).
+RUN pip install --no-cache-dir psycopg2-binary==2.9.9 pymysql==1.1.1 "trino[sqlalchemy]==0.337.0"
 
 COPY superset_config.py /app/pythonpath/superset_config.py
 COPY gunicorn_config.py /app/pythonpath/gunicorn_config.py

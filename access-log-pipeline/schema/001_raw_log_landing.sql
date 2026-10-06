@@ -6,5 +6,9 @@ CREATE TABLE IF NOT EXISTS raw_log_landing (
     source_log_id   BIGINT UNSIGNED NOT NULL,
     payload         JSON NOT NULL,
     ingested_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (source_log_id)
+    -- Superset's own dttm for the row, kept as a column so the ETL can reconcile counts per time window
+    -- (etl/sync_logs.py adds and fills it on databases created before this column existed).
+    source_dttm     DATETIME(6) NULL,
+    PRIMARY KEY (source_log_id),
+    KEY idx_source_dttm (source_dttm)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

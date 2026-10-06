@@ -18,6 +18,7 @@ API exactly as it would pull genuine traffic -- the simulation only replaces how
 log rows are produced, not how they're consumed.
 """
 import hashlib
+import json
 import os
 import random
 import secrets
@@ -32,6 +33,22 @@ FAKE_USER_COUNT = int(os.environ.get("SEED_FAKE_USER_COUNT", "12"))
 DAYS_OF_HISTORY = int(os.environ.get("SEED_DAYS_OF_HISTORY", "30"))
 SESSIONS_PER_DAY = int(os.environ.get("SEED_SESSIONS_PER_DAY", "40"))
 FAKE_USER_PASSWORD = os.environ.get("SEED_FAKE_USER_PASSWORD", "Sim3ulated!Pass")
+# Share of chart loads that fail (synthetic, for demos). 0 disables. The effective rate varies by ISO week and by
+# dashboard so the weekly and monthly views show a real trend instead of a flat line.
+SEED_ERROR_RATE = float(os.environ.get("SEED_ERROR_RATE", "0.03"))
+
+# What the synthetic failures look like. Production will produce causes we cannot predict, so the seed mixes several
+# kinds (message, relative weight, typical duration in ms): the error charts must work for any of them.
+SEED_ERROR_MIX = [
+    ("timeout", 55, (14900, 15600)),
+    ("canceling statement due to statement timeout", 8, (19000, 21000)),
+    ("Error: Columns missing in dataset: ['region', 'amount']", 12, (60, 600)),
+    ("syntax error at or near \"GROUP\"", 5, (40, 400)),
+    ("Access is Denied", 6, (20, 200)),
+    ("Failed to fetch", 7, (100, 3000)),
+    ("Dataset 41 not found", 4, (30, 300)),
+    ("unexpected response from the data source", 3, (200, 4000)),
+]
 
 FIRST_NAMES = [
     "Alex", "Sam", "Jordan", "Taylor", "Morgan", "Riley", "Casey", "Drew",
@@ -150,12 +167,30 @@ def zipf_weights(n: int, s: float = 1.3) -> list[float]:
     return [w / total for w in weights]
 
 
+def clamp_to_now(ts: datetime) -> datetime:
+    """Never generate an event in the future. A future-dated row looks 'not yet happened' to the ETL's
+    dttm watermark and used to be the root cause of skipped rows; real Superset never writes one."""
+    return min(ts, datetime.utcnow())
+
+
 def random_timestamp(days_back: int) -> datetime:
     day_offset = random.uniform(0, days_back)
     dt = datetime.utcnow() - timedelta(days=day_offset)
     # bias towards business hours, Mon-Fri, for realism
     hour = int(random.triangular(7, 20, 13))
-    return dt.replace(hour=min(hour, 23), minute=random.randint(0, 59), second=random.randint(0, 59))
+    return clamp_to_now(
+        dt.replace(hour=min(hour, 23), minute=random.randint(0, 59), second=random.randint(0, 59))
+    )
+
+
+def chart_load_ms() -> int:
+    """Browser-measured chart load time: mostly fast, with a slow tail so load-time metrics are meaningful."""
+    r = random.random()
+    if r < 0.90:
+        return random.randint(80, 3000)
+    if r < 0.98:
+        return random.randint(3000, 9000)
+    return random.randint(9000, 25000)
 
 
 def main():
@@ -179,8 +214,19 @@ def main():
         d["id"]: fetch_dashboard_chart_ids(conn, d["id"]) for d in dashboards
     }
 
+    # Failure-rate shape: some dashboards are flakier than others, and some weeks are worse than others.
+    dash_factor = {d["id"]: random.choice([0.3, 0.5, 1.0, 1.0, 2.0, 4.0]) for d in dashboards}
+    week_factor = {}
+
+    def error_probability(dashboard_id, ts):
+        week = ts.isocalendar()[1]
+        if week not in week_factor:
+            week_factor[week] = random.uniform(0.4, 2.2)
+        return min(0.5, SEED_ERROR_RATE * week_factor[week] * dash_factor[dashboard_id])
+
     total_sessions = DAYS_OF_HISTORY * SESSIONS_PER_DAY
     rows = []
+    seeded_errors = 0
     for _ in range(total_sessions):
         dashboard = random.choices(dashboards, weights=dash_weights, k=1)[0]
         user_id = random.choices(user_ids, weights=user_weights, k=1)[0]
@@ -198,15 +244,30 @@ def main():
                 chart_ids, k=min(len(chart_ids), random.randint(1, len(chart_ids)))
             )
             for chart_id in viewed_charts:
-                chart_ts = ts + timedelta(milliseconds=random.randint(50, 800))
-                rows.append(
-                    (user_id, "chart_data", "{}", dashboard["id"], chart_id, chart_ts,
-                     random.randint(80, 4000), referrer)
-                )
+                chart_ts = clamp_to_now(ts + timedelta(milliseconds=random.randint(50, 800)))
+                if SEED_ERROR_RATE > 0 and random.random() < error_probability(dashboard["id"], chart_ts):
+                    # A failed load, shaped like the row Superset's browser writes (generic 'log' row with the
+                    # event under json). The ETL counts it as a chart view AND as a browser error.
+                    message, _w, (lo, hi) = random.choices(SEED_ERROR_MIX, weights=[m[1] for m in SEED_ERROR_MIX], k=1)[0]
+                    duration = random.randint(lo, hi)
+                    payload = {
+                        "event_name": "load_chart", "slice_id": chart_id, "has_err": True,
+                        "error_details": message, "duration": duration, "synthetic": True,
+                    }
+                    rows.append(
+                        (user_id, "log", json.dumps(payload), dashboard["id"], chart_id, chart_ts,
+                         0, referrer)
+                    )
+                    seeded_errors += 1
+                else:
+                    rows.append(
+                        (user_id, "chart_data", "{}", dashboard["id"], chart_id, chart_ts,
+                         chart_load_ms(), referrer)
+                    )
 
         # occasional export action, for the "export vs view" distinction in docs
         if random.random() < 0.03 and chart_ids:
-            export_ts = ts + timedelta(seconds=random.randint(5, 120))
+            export_ts = clamp_to_now(ts + timedelta(seconds=random.randint(5, 120)))
             rows.append(
                 (user_id, "export_csv", "{}", dashboard["id"],
                  random.choice(chart_ids), export_ts, None, referrer)
@@ -222,7 +283,11 @@ def main():
     )
     conn.commit()
     print(f"inserted {len(rows)} simulated log rows across {len(dashboards)} dashboards "
-          f"and {len(user_ids)} users over {DAYS_OF_HISTORY} days")
+          f"and {len(user_ids)} users over {DAYS_OF_HISTORY} days "
+          f"({seeded_errors} synthetic failed chart loads, SEED_ERROR_RATE={SEED_ERROR_RATE})")
+    oldest = min(r[5] for r in rows)
+    print(f"oldest row is dated {oldest:%Y-%m-%d %H:%M:%S}. The ETL picks up past-dated rows on its own "
+          f"(lookback + reconciliation); to force it: python etl/sync_logs.py --since '{oldest:%Y-%m-%d %H:%M:%S}'")
     cur.close()
     conn.close()
 

@@ -531,10 +531,15 @@ def main():
         sql=ZERO_VIEW_DASHBOARDS_SQL, column_defs=ZERO_VIEW_DASHBOARDS_COLUMNS,
     )
 
-    chart_errors_id = get_or_create_dataset(
-        client, db_id, "vw_chart_errors",
-        sql=CHART_ERRORS_SQL, column_defs=CHART_ERRORS_COLUMNS,
-    )
+    # With the Iceberg sink on, errors live in Iceberg and the "Chart Load Errors" chart is built by
+    # bootstrap_iceberg.py on the "Dashboard Reliability and Speed" dashboard instead.
+    iceberg_on = os.environ.get("ICEBERG_SINK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    chart_errors_id = None
+    if not iceberg_on:
+        chart_errors_id = get_or_create_dataset(
+            client, db_id, "vw_chart_errors",
+            sql=CHART_ERRORS_SQL, column_defs=CHART_ERRORS_COLUMNS,
+        )
 
     dashboard_id = get_or_create_dashboard(client, DASHBOARD_TITLE)
 
@@ -566,10 +571,15 @@ def main():
         client, "Export Activity", fact_id, "table",
         export_activity_params(fact_id), dashboard_id,
     )
-    get_or_create_chart(
-        client, "Chart Load Errors", chart_errors_id, "table",
-        chart_errors_params(chart_errors_id), dashboard_id,
-    )
+    if chart_errors_id is not None:
+        get_or_create_chart(
+            client, "Chart Load Errors", chart_errors_id, "table",
+            chart_errors_params(chart_errors_id), dashboard_id,
+        )
+
+    if iceberg_on:
+        import bootstrap_iceberg  # noqa: E402  (same directory)
+        bootstrap_iceberg.main(client, sys.modules[__name__])  # pass this module's helpers (get_or_create_*)
 
     print(
         f"Superset bootstrap complete -- open '{DASHBOARD_TITLE}' at "

@@ -1,4 +1,5 @@
-requests==2.32.3
+requests==2.32.4
 PyMySQL==1.1.1
 psycopg2-binary==2.9.9
 python-dateutil==2.9.0.post0
+trino==0.337.0

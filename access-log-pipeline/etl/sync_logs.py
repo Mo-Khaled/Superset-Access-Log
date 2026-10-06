@@ -1,29 +1,44 @@
 """
 Incremental ETL: /api/v1/log/ (Superset) -> raw_log_landing / dim_users /
-dim_dashboards / fact_access_events (MySQL).
+dim_dashboards / fact_access_events (MySQL), and, when ICEBERG_SINK_ENABLED is on,
+fact_access_events / fact_error_events / dim_dashboards in Iceberg through Trino.
 
-Run standalone: `python etl/sync_logs.py` (PYTHONPATH must include the pipeline
-root -- see the Dockerfile / README). Safe to re-run: reads its high-water-mark
-from etl_sync_state before pulling, and only advances it after a successful,
-committed batch, so a re-run after a partial failure just re-pulls the same page
-and upserts (idempotent on primary keys) rather than duplicating rows.
+Run standalone: `python etl/sync_logs.py [--since TIMESTAMP | --full]` (PYTHONPATH must include
+the pipeline root -- see the Dockerfile / README).
+
+Safe to re-run, and built so past-dated rows cannot be silently skipped:
+  * LogRestApi cannot filter by id, so the pull filters on `dttm > watermark`. A row inserted later with an
+    OLDER dttm (late browser flush, clock skew, downtime, a backfill) would never be seen. Three guards:
+      1. lookback: every pull starts at `watermark - ETL_LOOKBACK_HOURS` (default 24)
+      2. reconciliation: after the pull, the API total is compared with raw_log_landing; if the API has more
+         rows than we hold, the whole log is re-pulled once and a WARNING is printed
+      3. `--since TIMESTAMP` / `--full` for a deliberate backfill
+  * Re-reading is always safe: MySQL uses INSERT IGNORE, Iceberg uses MERGE.
+  * The watermark moves only after every write (including Iceberg) succeeded, so a failed run is simply retried.
+  * Single writer: a MySQL advisory lock stops two runs from writing at once (Iceberg MERGEs would conflict).
 
 Scheduling (see README/WRITEUP for detail): designed to be invoked by an external
 scheduler (cron in this sandbox; Airflow or a k8s CronJob in prod) rather than
 looping internally -- each run does one bounded incremental sync and exits.
 """
+import argparse
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pymysql
 import pymysql.cursors
 
+import iceberg_sink
+from error_classify import classify, one_line, signature
 from superset_client import SupersetClient
 
 PAGE_SIZE = int(os.environ.get("ETL_PAGE_SIZE", "100"))
 SOURCE_NAME = os.environ.get("ETL_SOURCE_NAME", "local_superset")
+LOOKBACK_HOURS = float(os.environ.get("ETL_LOOKBACK_HOURS", "24"))
+LOCK_NAME = "etl_sync_logs"
+EPOCH = datetime(1970, 1, 1)
 
 # Actions we classify into the fact table; everything else from LogRestApi (e.g.
 # generic 'log' rows for non-view interactions) is still staged in raw_log_landing
@@ -92,17 +107,81 @@ def extract_browser_error(row):
         return None
     if payload.get("event_name") != "load_chart" or not payload.get("has_err"):
         return None
-    details = str(payload.get("error_details") or "unknown")
+    details = one_line(payload.get("error_details") or "unknown", 500)
     duration = payload.get("duration")
     reason = f"Browser reported chart load failure: {details}"
     if duration is not None:
         reason += f" after {int(duration)} ms"
     return {
-        "error_type": details[:50],
+        "error_type": "load_chart_error",
         "reason": reason[:500],
         "duration_ms": int(duration) if duration is not None else None,
         "chart_id": row.get("slice_id"),
+        # cause-agnostic: whatever the browser reported, keep the raw message and derive a category and a signature
+        "error_category": classify(details),
+        "error_signature": signature(details),
+        "error_message": details,
     }
+
+
+def _payload(row):
+    payload = row.get("json")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_metrics(row, action):
+    """(duration_ms, is_error) for a chart view. Real browser load_chart rows carry the load time in
+    json.duration; seeded rows carry it in the log row's own duration_ms. Dashboard views have none."""
+    if action != "chart_view":
+        return None, False
+    if row.get("action") == "log":
+        p = _payload(row)
+        duration = p.get("duration")
+        return (int(duration) if duration is not None else None), bool(p.get("has_err"))
+    duration = row.get("duration_ms")
+    return (int(duration) if duration is not None else None), False
+
+
+def build_event_rows(row):
+    """Turns one Superset log row into (access_row, error_row), either may be None. Shared by the ETL and the
+    Iceberg backfill, so both classify a log row identically. Returns (None, None) when the row has no usable
+    timestamp."""
+    ts = _parse_dttm(row.get("dttm"))
+    if ts is None:
+        return None, None
+    log_id = row["id"]
+    access = error = None
+    action = _classify_action(row)
+    if action is not None:
+        duration, is_error = _load_metrics(row, action)
+        access = {
+            "event_id": log_id, "event_ts": ts, "user_id": row.get("user_id"),
+            "dashboard_id": row.get("dashboard_id"), "chart_id": row.get("slice_id"),
+            "action": action, "raw_log_id": log_id, "duration_ms": duration, "is_error": is_error,
+        }
+    err = extract_browser_error(row)
+    if err is not None:
+        error = {
+            "dedupe_key": f"browser:{log_id}", "event_ts": ts, "source": "browser",
+            "error_type": err["error_type"], "reason": err["reason"], "user_id": row.get("user_id"),
+            "dashboard_id": row.get("dashboard_id"), "chart_id": err["chart_id"],
+            "duration_ms": err["duration_ms"], "raw_log_id": log_id,
+            "error_category": err["error_category"], "error_signature": err["error_signature"],
+            "error_message": err["error_message"], "status_code": None, "request_path": None, "request_id": None,
+        }
+    return access, error
+
+
+def acquire_etl_lock(conn):
+    """Single-writer guard. MySQL advisory locks belong to the connection and are released when it closes."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT GET_LOCK(%s, 0) AS got", (LOCK_NAME,))
+        return cur.fetchone()["got"] == 1
 
 
 def insert_error_event(cur, row, err):
@@ -204,7 +283,7 @@ def fetch_log_pages(client: SupersetClient, since_ts):
         page += 1
 
 
-def sync_all_dashboards(client: SupersetClient, conn):
+def sync_all_dashboards(client: SupersetClient, conn, sink=None):
     """Upserts every dashboard Superset currently knows about into dim_dashboards --
     not just ones referenced by a log row. A dashboard with zero views never
     appears in a log pull at all, so without this pass it could never show up
@@ -219,6 +298,9 @@ def sync_all_dashboards(client: SupersetClient, conn):
                 break
             for d in result:
                 owners = ", ".join(o.get("username", "") for o in d.get("owners", []))
+                if sink is not None:
+                    sink.add_dashboard({"dashboard_id": d["id"],
+                                        "title": d.get("dashboard_title", f"Dashboard {d['id']}")})
                 cur.execute(
                     """
                     INSERT INTO dim_dashboards (dashboard_id, title, owner_names, created_on, changed_on)
@@ -284,50 +366,88 @@ def upsert_dim_user(client: SupersetClient, cache: dict, cur, user_id, username_
     cache[user_id] = True
 
 
-def run():
-    client = SupersetClient()
-    conn = mysql_conn()
-    sync_all_dashboards(client, conn)
-    last_log_id, last_ts = get_sync_state(conn)
+def ensure_landing_dttm(conn):
+    """Migration for databases created before raw_log_landing.source_dttm existed (the MySQL init scripts only run
+    on a fresh volume). Adds the column and fills it from the stored payloads. A no-op once done."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'raw_log_landing' AND COLUMN_NAME = 'source_dttm'"
+        )
+        if cur.fetchone()["n"] == 0:
+            cur.execute("ALTER TABLE raw_log_landing ADD COLUMN source_dttm DATETIME(6) NULL, "
+                        "ADD KEY idx_source_dttm (source_dttm)")
+            conn.commit()
+        while True:
+            cur.execute("SELECT source_log_id, payload FROM raw_log_landing WHERE source_dttm IS NULL LIMIT 2000")
+            rows = cur.fetchall()
+            if not rows:
+                break
+            updates = []
+            for r in rows:
+                payload = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
+                # a row with no usable timestamp gets the epoch so this loop always terminates
+                updates.append((_parse_dttm(payload.get("dttm")) or EPOCH, r["source_log_id"]))
+            cur.executemany("UPDATE raw_log_landing SET source_dttm = %s WHERE source_log_id = %s", updates)
+            conn.commit()
 
-    dashboard_cache, user_cache = {}, {}
-    total_raw, total_fact, total_err = 0, 0, 0
-    max_log_id = last_log_id
-    max_ts = last_ts
 
-    for page in fetch_log_pages(client, last_ts):
+def api_log_total(client: SupersetClient, until=None):
+    """Number of rows Superset's log holds (the `count` field of the list endpoint), optionally only rows dated
+    before `until`. Counting a fixed window on both sides is what makes the reconciliation reliable: the ETL's own
+    API calls keep adding rows to Superset's log, which would hide a few missing rows in a total count."""
+    # NOTE: this API silently IGNORES the operators lte/le/gte/ge (it returns the unfiltered count); only lt and gt
+    # filter. Verified against Superset 4.1.4. Use lt/gt only.
+    if until is None:
+        q = "(page:0,page_size:1)"
+    else:
+        q = f"(filters:!((col:dttm,opr:lt,value:'{until.isoformat()}')),page:0,page_size:1)"
+    return int(client.get(f"/api/v1/log/?q={q}").json().get("count", 0))
+
+
+def landing_total(conn, until=None):
+    with conn.cursor() as cur:
+        if until is None:
+            cur.execute("SELECT COUNT(*) AS n FROM raw_log_landing")
+        else:
+            cur.execute("SELECT COUNT(*) AS n FROM raw_log_landing WHERE source_dttm < %s", (until,))
+        return cur.fetchone()["n"]
+
+
+def pull(client, conn, since_ts, sink, stats, dashboard_cache, user_cache):
+    """One pass over the Superset log from since_ts. Updates `stats`; returns (max_log_id, max_dttm).
+    Everything written here is idempotent, so overlapping passes are harmless."""
+    max_log_id, max_ts = 0, None
+    for page in fetch_log_pages(client, since_ts):
         with conn.cursor() as cur:
             for row in page:
                 log_id = row["id"]
                 max_log_id = max(max_log_id, log_id)
 
+                parsed = _parse_dttm(row.get("dttm"))
                 cur.execute(
-                    """
-                    INSERT IGNORE INTO raw_log_landing (source_log_id, payload)
-                    VALUES (%s, %s)
-                    """,
-                    (log_id, json.dumps(row, default=str)),
+                    "INSERT IGNORE INTO raw_log_landing (source_log_id, payload, source_dttm) VALUES (%s, %s, %s)",
+                    (log_id, json.dumps(row, default=str), parsed),
                 )
-                total_raw += 1
+                stats["raw_seen"] += 1
+                stats["raw_new"] += cur.rowcount
 
-                fact_action = _classify_action(row)
-                dttm = row.get("dttm")
-                if dttm:
-                    max_ts = dttm
+                if parsed is not None and (max_ts is None or parsed > max_ts):
+                    max_ts = parsed
 
                 user_id = row.get("user_id")
                 username_hint = (row.get("user") or {}).get("username") if isinstance(row.get("user"), dict) else None
                 upsert_dim_user(client, user_cache, cur, user_id, username_hint)
+                upsert_dim_dashboard(client, dashboard_cache, cur, row.get("dashboard_id"))
 
-                dashboard_id = row.get("dashboard_id")
-                upsert_dim_dashboard(client, dashboard_cache, cur, dashboard_id)
-
-                browser_err = extract_browser_error(row)
-                if browser_err is not None:
-                    insert_error_event(cur, row, browser_err)
-                    total_err += 1
-
-                if fact_action is None:
+                access, error = build_event_rows(row)
+                if error is not None:
+                    stats["errors"] += 1
+                    if sink is not None:
+                        sink.add_error(error)
+                    else:  # no Iceberg: keep the legacy MySQL error table so errors are not lost
+                        insert_error_event(cur, row, extract_browser_error(row))
+                if access is None:
                     continue  # staged in raw_log_landing only; not an access event we rank on
 
                 cur.execute(
@@ -336,44 +456,94 @@ def run():
                         (event_id, event_ts, user_id, dashboard_id, chart_id, action, source_ip, raw_log_id)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (log_id, dttm, user_id, dashboard_id, row.get("slice_id"),
-                     fact_action, None, log_id),
+                    (log_id, row.get("dttm"), user_id, access["dashboard_id"], access["chart_id"],
+                     access["action"], None, log_id),
                     # source_ip is always NULL: LogRestApi's Log model does not
                     # capture client IP at all (see WRITEUP.md "gaps" section).
                 )
-                total_fact += 1
+                stats["fact"] += 1
+                if sink is not None:
+                    sink.add_access(access)
+        conn.commit()
+    return max_log_id, max_ts
 
+
+def run(since=None, full=False):
+    client = SupersetClient()
+    conn = mysql_conn()
+    if not acquire_etl_lock(conn):
+        print(f"another ETL run holds the lock '{LOCK_NAME}'; skipping this run (single writer)")
+        conn.close()
+        return 0
+
+    ensure_landing_dttm(conn)
+    sink = iceberg_sink.IcebergSink() if iceberg_sink.enabled() else None
+    sync_all_dashboards(client, conn, sink)
+    last_log_id, last_ts = get_sync_state(conn)
+    watermark = _parse_dttm(last_ts)
+
+    # Reconciliation window: everything Superset dated up to t0. After the pull we must hold every one of
+    # those rows; if Superset has more than we do, the watermark filter skipped some.
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if full:
+        start = EPOCH
+    elif since is not None:
+        start = since
+    elif watermark is not None:
+        start = watermark - timedelta(hours=LOOKBACK_HOURS)
+    else:
+        start = EPOCH
+
+    stats = {"raw_seen": 0, "raw_new": 0, "fact": 0, "errors": 0}
+    dashboard_cache, user_cache = {}, {}
+    max_log_id, max_ts = pull(client, conn, start, sink, stats, dashboard_cache, user_cache)
+
+    api_n, held = api_log_total(client, t0), landing_total(conn, t0)
+    gap = api_n - held
+    if gap > 0 and start > EPOCH:
+        print(f"WARNING: Superset's log has {gap} rows dated up to {t0:%Y-%m-%d %H:%M:%S} that we do not hold "
+              f"(api={api_n}, landing={held}); the watermark filter skipped them. "
+              f"Re-pulling the whole log once (idempotent).")
+        mid, mts = pull(client, conn, EPOCH, sink, stats, dashboard_cache, user_cache)
+        max_log_id = max(max_log_id, mid)
+        if mts is not None and (max_ts is None or mts > max_ts):
+            max_ts = mts
+        held = landing_total(conn, t0)
+        gap = api_n - held
+    if gap > 0:
+        print(f"WARNING: still {gap} rows short after a full pull (api={api_n}, landing={held}); "
+              f"a row may have been committed late. Not retrying; the next run will look again.")
+
+    iceberg_written = sink.flush() if sink is not None else None  # must succeed before the watermark moves
+
+    # Never move the watermark backwards, and never into the future: a future-dated row (bad clock, an old seed
+    # script) would otherwise make every later real event look "already seen".
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    new_ts = max([t for t in (max_ts, watermark) if t is not None], default=None)
+    if new_ts is not None and new_ts > now_utc:
+        new_ts = now_utc
+    if new_ts is not None:
+        set_sync_state(conn, max(last_log_id, max_log_id), new_ts)
         conn.commit()
 
-    if total_raw > 0:
-        # Guard against ever persisting a watermark that's in the future.
-        # Genuine Superset usage always logs dttm = real event time, but this
-        # sandbox's seed script (seed/generate_activity.py) backfills
-        # synthetic history whose timestamps aren't clamped to "now" -- a
-        # seeded row can land later in the day than the real wall clock. If
-        # such a row advances the watermark ahead of "now", every later
-        # *real* event today (dttm <= now < that future watermark) would be
-        # silently excluded by the `dttm > since_ts` filter above -- forever,
-        # since the watermark never rewinds. Capping at "now" just means a
-        # future-dated row gets safely re-fetched (and no-op re-ignored, via
-        # INSERT IGNORE) on later runs until real time catches up to it.
-        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
-        parsed_max_ts = _parse_dttm(max_ts)
-        if parsed_max_ts is not None and parsed_max_ts > now_utc:
-            max_ts = now_utc
-        with conn.cursor() as cur:
-            set_sync_state(conn, max_log_id, max_ts)
-        conn.commit()
-
-    print(f"synced through log id {max_log_id}: {total_raw} raw rows staged, "
-          f"{total_fact} fact rows inserted, {total_err} browser errors seen "
-          f"(dupes ignored on re-run)")
+    print(f"synced through log id {max(last_log_id, max_log_id)}: {stats['raw_seen']} log rows read "
+          f"({stats['raw_new']} new in raw_log_landing), {stats['fact']} access events, "
+          f"{stats['errors']} browser errors; pull started at {start:%Y-%m-%d %H:%M:%S}")
+    if iceberg_written is not None:
+        print(f"iceberg: sent {iceberg_written['access']} access rows, {iceberg_written['errors']} error rows, "
+              f"{iceberg_written['dashboards']} dashboards to MERGE (rows already present are left untouched)")
     conn.close()
+    return 0
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Incremental Superset log ETL")
+    ap.add_argument("--since", help="re-pull from this timestamp (ISO), for a known backfill")
+    ap.add_argument("--full", action="store_true", help="re-pull the whole Superset log (idempotent)")
+    args = ap.parse_args()
     try:
-        run()
+        sys.exit(run(since=_parse_dttm(args.since) if args.since else None, full=args.full))
     except Exception as exc:
         print(f"ETL run failed: {exc}", file=sys.stderr)
         raise
