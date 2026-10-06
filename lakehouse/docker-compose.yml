@@ -1,0 +1,95 @@
+# Lab stand-in for the bank's existing Iceberg + Trino platform.
+# NOT part of the target architecture: in the real environment the pipeline and Superset
+# point at the bank's own Trino (see TRINO_* in the root .env.example) and none of this is deployed.
+#
+#   docker compose -f lakehouse/docker-compose.yml up -d     # starts exactly these services
+#
+# Services: minio (object store) -> iceberg-rest (catalog) -> trino (SQL engine).
+# minio-bootstrap and catalog-init are one-shot helpers that exit when done.
+name: scb-lakehouse
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_API_PORT:-9102}:9000"
+      - "${MINIO_CONSOLE_PORT:-9103}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+
+  minio-bootstrap:
+    image: quay.io/minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    entrypoint: >-
+      /bin/sh -c
+      "mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}
+      && mc mb --ignore-existing local/warehouse"
+
+  catalog-init:
+    image: busybox
+    command: ["chown", "-R", "1000:1000", "/var/iceberg-catalog"]
+    volumes:
+      - catalog_data:/var/iceberg-catalog
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    depends_on:
+      minio-bootstrap:
+        condition: service_completed_successfully
+      catalog-init:
+        condition: service_completed_successfully
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH-STYLE-ACCESS: "true"
+      CATALOG_URI: "jdbc:sqlite:file:/var/iceberg-catalog/catalog.db?journal_mode=WAL&busy_timeout=30000"
+    ports:
+      - "${ICEBERG_REST_PORT:-8183}:8181"
+    volumes:
+      - catalog_data:/var/iceberg-catalog
+
+  trino:
+    image: trinodb/trino:483
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    environment:
+      # read by ${ENV:...} in trino/etc/catalog/iceberg.properties
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${TRINO_PORT:-8085}:8080"
+    volumes:
+      - ./trino/etc:/etc/trino:ro
+    healthcheck:
+      test: ["CMD-SHELL", "trino --execute 'select 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+networks:
+  default:
+    name: scb-lakehouse
+
+volumes:
+  minio_data:
+  catalog_data:

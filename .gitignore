@@ -17,3 +17,6 @@ intermittent-error/logs_after/*
 # OS
 .DS_Store
 Thumbs.db
+
+# lab lakehouse credentials (copy lakehouse/.env.example)
+lakehouse/.env
