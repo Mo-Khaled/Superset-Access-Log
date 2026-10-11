@@ -228,7 +228,7 @@ Everything is in Iceberg (`iceberg.monitoring`, Parquet, format version 2), read
 | `raw_log_landing` | Verbatim JSON of every Superset log row, keyed by Superset's own log id | Superset may delete old logs. With a raw copy the other tables can be rebuilt after a bug fix or a new metric. The ETL's watermark is read from it. |
 | `fact_access_events` | One row per dashboard view, chart view or export, with `duration_ms` (browser-measured load time) and `is_error` | The usage numbers. Partitioned by day. |
 | `fact_error_events` | One row per failure of any cause: `source`, category, signature, raw message, status, user, dashboard, chart | Errors need their own table: `fact_access_events` counts a failed `load_chart` as an ordinary `chart_view`, deliberately, because it is a usage table. |
-| `dim_dashboards`, `dim_users` | Titles/owners, user names | Keeps the fact table small; a renamed dashboard shows its new title everywhere. |
+| `dim_dashboards`, `dim_charts`, `dim_users` | Dashboard titles/owners, chart names, user names | Keeps the fact table small; a renamed dashboard or chart shows its new name everywhere. Charts and dashboards are synced from Superset's API on every run. |
 | `etl_lock` | The single-writer lease (one row) | Iceberg has no locks, see [4.2](#42-single-writer-without-locks). |
 | `etl_run_log` | One row per run (sync, ingest, maintenance) with status and counts | What to alert on, see [4.4](#44-scheduling-and-alerting). |
 | `vw_chart_failure_rate` (view) | Per day and dashboard: `chart_loads`, `rated_loads`, `failed_loads`, `authorization_denied`, `server_kills`, `server_errors` (future-dated rows excluded) | The failure-rate dashboards. |
@@ -450,7 +450,7 @@ statement that loses a commit race is retried with backoff (`ICEBERG_COMMIT_RETR
 - **Maintenance.** `etl/iceberg_maintenance.py` runs from `run_etl.sh` and does real work about once a day
   (`MAINTENANCE_INTERVAL_HOURS`): `optimize` (compaction), `expire_snapshots` and `remove_orphan_files` (`ICEBERG_RETENTION`,
   default 7d, which must not be below the catalog's minimum). Force it with `docker compose exec -T pipeline python
-  etl/iceberg_maintenance.py --force` (expect `maintenance done for 7 tables (retention 7d)`). If another team already compacts
+  etl/iceberg_maintenance.py --force` (expect `maintenance done for 8 tables (retention 7d)`). If another team already compacts
   these tables, hand them those statements and skip the call.
 - **Rebuilds.** After changing how log rows are classified: `docker compose exec -T pipeline python etl/backfill_iceberg.py`
   (replays `raw_log_landing`; expect `replayed N raw log rows; ...`). After adding a classifier rule:
@@ -536,7 +536,7 @@ dashboard time-range filter, drill-downs and export-to-CSV.
 
 | Dashboard | Charts |
 |---|---|
-| **Superset Usage Analytics** | Total Dashboard Views and Active Users (KPIs), Most Viewed Dashboards (views + unique viewers), Dashboard Views Over Time, User Activity, Zero-View Dashboards (deprecation candidates), Export Activity |
+| **Superset Usage Analytics** | Total Dashboard Views and Active Users (KPIs), Most Viewed Dashboards (views + unique viewers), Dashboard Views Over Time, User Activity (per user: events, dashboard and chart views, last active, and a `viewed` column with their top 5 dashboards and top 5 charts with view counts and "+N more"), Zero-View Dashboards (deprecation candidates), Export Activity |
 | **Dashboard Reliability and Speed** | Failure Rate (daily, weekly, monthly), Failed vs Total Chart Loads, Failure Rate by Dashboard, Chart Load Time (average and p95), Slow Loads by Dashboard, Errors by Category, Top Error Messages, Chart Load Errors (the individual failures) |
 
 Talking points: the failure rate is a ratio of sums and a **lower bound** (the `Server kills` column is the server-side count that

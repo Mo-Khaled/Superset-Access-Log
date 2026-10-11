@@ -24,7 +24,7 @@ import iceberg_state
 from sync_logs import LOCK_NAME
 
 TABLES = ["fact_access_events", "fact_error_events", "raw_log_landing", "etl_run_log",
-          "dim_dashboards", "dim_users", "etl_lock"]
+          "dim_dashboards", "dim_charts", "dim_users", "etl_lock"]
 RETENTION = os.environ.get("ICEBERG_RETENTION", "7d")
 FILE_SIZE_THRESHOLD = os.environ.get("ICEBERG_OPTIMIZE_FILE_SIZE", "128MB")
 INTERVAL_HOURS = float(os.environ.get("MAINTENANCE_INTERVAL_HOURS", "24"))

@@ -116,6 +116,7 @@ ERROR_SPEC = [
 ]
 DASH_SPEC = [("dashboard_id", "integer"), ("title", "varchar"), ("owner_names", "varchar"),
              ("created_on", "timestamp(6)"), ("changed_on", "timestamp(6)")]
+CHART_SPEC = [("chart_id", "integer"), ("name", "varchar"), ("changed_on", "timestamp(6)")]
 USER_SPEC = [("user_id", "integer"), ("username", "varchar"), ("first_name", "varchar"), ("last_name", "varchar"),
              ("email", "varchar"), ("is_active", "boolean")]
 RAW_SPEC = [("source_log_id", "bigint"), ("source_dttm", "timestamp(6)"), ("payload", "varchar")]
@@ -187,6 +188,16 @@ def merge_dashboards_sql(rows):
     )
 
 
+def merge_charts_sql(rows):
+    return (
+        "MERGE INTO dim_charts t USING (%s) s\n"
+        "ON t.chart_id = s.chart_id\n"
+        "WHEN MATCHED AND (t.name IS DISTINCT FROM s.name OR t.changed_on IS DISTINCT FROM s.changed_on) THEN UPDATE SET\n"
+        "    name = s.name, changed_on = s.changed_on\n"
+        "WHEN NOT MATCHED THEN INSERT %s" % (_typed_source(rows, CHART_SPEC), _insert_cols(CHART_SPEC))
+    )
+
+
 def merge_users_sql(rows):
     return (
         "MERGE INTO dim_users t USING (%s) s\n"
@@ -221,8 +232,9 @@ class IcebergSink:
         self.conn = conn or trino_conn()
         self.on_progress = on_progress  # called after every statement, e.g. to renew the single-writer lease
         self.access, self.errors, self.dashboards, self.users, self.raw = {}, {}, {}, {}, {}
+        self.charts = {}
         self.raw_chars = 0
-        self.written = {"access": 0, "errors": 0, "dashboards": 0, "users": 0, "raw": 0}
+        self.written = {"access": 0, "errors": 0, "dashboards": 0, "charts": 0, "users": 0, "raw": 0}
 
     def _run(self, sql):
         run_sql(self.conn, sql)
@@ -242,6 +254,9 @@ class IcebergSink:
 
     def add_dashboard(self, row):
         self.dashboards[row["dashboard_id"]] = row
+
+    def add_chart(self, row):
+        self.charts[row["chart_id"]] = row
 
     def add_user(self, row):
         self.users[row["user_id"]] = row
@@ -269,6 +284,10 @@ class IcebergSink:
             self._run(merge_dashboards_sql(list(self.dashboards.values())))
             self.written["dashboards"] += len(self.dashboards)
             self.dashboards = {}
+        if self.charts:
+            self._run(merge_charts_sql(list(self.charts.values())))
+            self.written["charts"] += len(self.charts)
+            self.charts = {}
         if self.users:
             self._run(merge_users_sql(list(self.users.values())))
             self.written["users"] += len(self.users)

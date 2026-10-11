@@ -261,6 +261,22 @@ def sync_all_dashboards(client: SupersetClient, sink):
         page += 1
 
 
+def sync_all_charts(client: SupersetClient, sink):
+    """Sends every chart's name to dim_charts, so usage reports can show chart names instead of ids."""
+    page = 0
+    while True:
+        resp = client.get(f"/api/v1/chart/?q=(page:{page},page_size:100)")
+        result = resp.json().get("result", [])
+        if not result:
+            break
+        for c in result:
+            sink.add_chart({"chart_id": c["id"], "name": c.get("slice_name") or f"Chart {c['id']}",
+                            "changed_on": _parse_dttm(c.get("changed_on"))})
+        if len(result) < 100:
+            break
+        page += 1
+
+
 def enrich_dashboard(client: SupersetClient, cache: dict, sink, dashboard_id):
     """Covers a dashboard that is in the log but not in the listing (deleted, or created since the listing)."""
     if dashboard_id is None or dashboard_id in cache:
@@ -341,6 +357,7 @@ def run(since=None, full=False, reprocess=False):
 def _run_locked(client, conn, lease, stats, since, full, reprocess):
     sink = iceberg_sink.IcebergSink(on_progress=lease.renew)
     sync_all_dashboards(client, sink)
+    sync_all_charts(client, sink)
     watermark, last_log_id = iceberg_state.get_watermark(conn)
 
     # Reconciliation window: everything Superset dated up to t0. After the pull we must hold every one of
@@ -385,7 +402,7 @@ def _run_locked(client, conn, lease, stats, since, full, reprocess):
           f"({stats['raw_new']} new, {already} already stored), "
           f"{stats['fact']} access events, {stats['errors']} browser errors; pull started at {start:%Y-%m-%d %H:%M:%S}")
     print(f"iceberg: sent {written['access']} access rows, {written['errors']} error rows, {written['raw']} raw rows, "
-          f"{written['dashboards']} dashboards, {written['users']} users to MERGE (rows already present are left untouched)")
+          f"{written['dashboards']} dashboards, {written['charts']} charts, {written['users']} users to MERGE (rows already present are left untouched)")
     return 0
 
 

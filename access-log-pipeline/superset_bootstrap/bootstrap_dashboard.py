@@ -58,17 +58,69 @@ WHERE f.action = 'dashboard_view'
 GROUP BY f.dashboard_id, d.title
 """.strip()
 
+# `viewed` lists, per user, the TOP_VIEWED most viewed dashboards and charts with their view counts, then how many more
+# there are. Chart names come from dim_charts (a chart that no longer exists in Superset shows as "Chart <id> (removed)").
+TOP_VIEWED = 5
 USER_ACTIVITY_SQL = f"""
+WITH dash AS (
+    SELECT user_id, title, n, rn, total FROM (
+        SELECT f.user_id,
+               COALESCE(d.title, 'Dashboard ' || CAST(f.dashboard_id AS varchar)) AS title,
+               COUNT(*) AS n,
+               row_number() OVER (PARTITION BY f.user_id ORDER BY COUNT(*) DESC, f.dashboard_id) AS rn,
+               count(*) OVER (PARTITION BY f.user_id) AS total
+        FROM {T}.fact_access_events f
+        LEFT JOIN {T}.dim_dashboards d ON d.dashboard_id = f.dashboard_id
+        WHERE f.action = 'dashboard_view' AND f.dashboard_id IS NOT NULL
+        GROUP BY f.user_id, f.dashboard_id, d.title
+    ) WHERE rn <= {TOP_VIEWED}
+),
+chart AS (
+    SELECT user_id, title, n, rn, total FROM (
+        SELECT f.user_id,
+               COALESCE(c.name, 'Chart ' || CAST(f.chart_id AS varchar) || ' (removed)') AS title,
+               COUNT(*) AS n,
+               row_number() OVER (PARTITION BY f.user_id ORDER BY COUNT(*) DESC, f.chart_id) AS rn,
+               count(*) OVER (PARTITION BY f.user_id) AS total
+        FROM {T}.fact_access_events f
+        LEFT JOIN {T}.dim_charts c ON c.chart_id = f.chart_id
+        WHERE f.action = 'chart_view' AND f.chart_id IS NOT NULL
+        GROUP BY f.user_id, f.chart_id, c.name
+    ) WHERE rn <= {TOP_VIEWED}
+),
+dash_s AS (
+    SELECT user_id,
+           array_join(array_agg(title || ' (' || CAST(n AS varchar) || ')' ORDER BY rn), ', ')
+           || CASE WHEN max(total) > {TOP_VIEWED} THEN ' +' || CAST(max(total) - {TOP_VIEWED} AS varchar) || ' more' ELSE '' END AS s
+    FROM dash GROUP BY user_id
+),
+chart_s AS (
+    SELECT user_id,
+           array_join(array_agg(title || ' (' || CAST(n AS varchar) || ')' ORDER BY rn), ', ')
+           || CASE WHEN max(total) > {TOP_VIEWED} THEN ' +' || CAST(max(total) - {TOP_VIEWED} AS varchar) || ' more' ELSE '' END AS s
+    FROM chart GROUP BY user_id
+),
+activity AS (
+    SELECT f.user_id AS user_id,
+           COUNT(*) AS event_count,
+           SUM(CASE WHEN f.action = 'dashboard_view' THEN 1 ELSE 0 END) AS dashboard_views,
+           SUM(CASE WHEN f.action = 'chart_view' THEN 1 ELSE 0 END) AS chart_views,
+           MAX(f.event_ts) AS last_active
+    FROM {T}.fact_access_events f
+    GROUP BY f.user_id
+)
 SELECT
-    f.user_id AS user_id,
-    COALESCE(u.username, 'user_' || CAST(f.user_id AS varchar)) AS username,
-    COUNT(*) AS event_count,
-    SUM(CASE WHEN f.action = 'dashboard_view' THEN 1 ELSE 0 END) AS dashboard_views,
-    SUM(CASE WHEN f.action = 'chart_view' THEN 1 ELSE 0 END) AS chart_views,
-    MAX(f.event_ts) AS last_active
-FROM {T}.fact_access_events f
-LEFT JOIN {T}.dim_users u ON u.user_id = f.user_id
-GROUP BY f.user_id, u.username
+    a.user_id AS user_id,
+    COALESCE(u.username, 'user_' || CAST(a.user_id AS varchar)) AS username,
+    a.event_count AS event_count,
+    a.dashboard_views AS dashboard_views,
+    a.chart_views AS chart_views,
+    a.last_active AS last_active,
+    'Dashboards: ' || COALESCE(ds.s, '-') || ' | Charts: ' || COALESCE(cs.s, '-') AS viewed
+FROM activity a
+LEFT JOIN {T}.dim_users u ON u.user_id = a.user_id
+LEFT JOIN dash_s ds ON ds.user_id = a.user_id
+LEFT JOIN chart_s cs ON cs.user_id = a.user_id
 """.strip()
 
 ZERO_VIEW_DASHBOARDS_SQL = f"""
@@ -105,6 +157,7 @@ USER_ACTIVITY_COLUMNS = [
     ("dashboard_views", "BIGINT", False),
     ("chart_views", "BIGINT", False),
     ("last_active", "TIMESTAMP(6)", True),
+    ("viewed", "VARCHAR", False),
 ]
 ZERO_VIEW_DASHBOARDS_COLUMNS = [
     ("dashboard_id", "INTEGER", False),
@@ -394,6 +447,7 @@ def user_activity_params(dataset_id):
                 "dashboard_views",
                 "chart_views",
                 "last_active",
+                "viewed",
             ],
             "order_by_cols": ['["event_count", false]'],
             "row_limit": 50,
