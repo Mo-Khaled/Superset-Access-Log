@@ -20,7 +20,7 @@ Safe to re-run, and built so past-dated rows cannot be silently skipped:
   * Single writer: a lease row in Iceberg (etl/iceberg_state.py) stops two runs from writing at once. Commit conflicts
     that still happen are retried (iceberg_sink.run_sql), and every write is idempotent.
 
-Scheduling (see README/WRITEUP for detail): designed to be invoked by an external
+Scheduling (see README.md, Part 6, for detail): designed to be invoked by an external
 scheduler (cron in this sandbox; Airflow or a k8s CronJob in prod) rather than
 looping internally -- each run does one bounded incremental sync and exits.
 """

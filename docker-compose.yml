@@ -7,7 +7,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     # Published on 15432 (not the default 5432) to avoid clashing with any local
     # Postgres already on the host. For ad-hoc DB client access (DBeaver etc.) --
-    # see DBEAVER_GUIDE.md.
+    # see README.md, Part 4.
     ports:
       - "15432:5432"
     volumes:
