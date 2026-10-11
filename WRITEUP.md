@@ -26,15 +26,17 @@ Two choices worth knowing:
 
 ## 2. Running the ETL in production
 
-`etl/sync_logs.py` does one bounded run and exits. A failed run does not move the
-"how far did we get" marker, so the next run simply retries the same data.
+`etl/sync_logs.py` does one bounded run and exits. The "how far did we get" marker is derived from the
+data already stored (`raw_log_landing`, written last), so a failed run cannot move it and the next run
+simply retries the same data.
 
 - **This lab:** cron every 10 minutes, calling `access-log-pipeline/run_etl.sh`.
 - **Production, simple:** a Kubernetes `CronJob` with `concurrencyPolicy: Forbid`
   (so two runs never overlap) and an alert when a job fails.
 - **Production, bigger:** an Airflow DAG, for retries, alerts and run history.
-- **Alert on staleness too:** if `etl_sync_state.updated_at` stops moving, the
-  scheduler itself has stopped, even if no single run reported a failure.
+- **Alert on staleness too:** every run appends a row to `etl_run_log`. If the latest row with
+  `kind = 'sync'` and `status = 'ok'` gets older than a few intervals, the scheduler itself has stopped,
+  even if no single run reported a failure.
 
 ## 3. The intermittent chart timeout
 
@@ -133,7 +135,7 @@ seeded demo data hid them. The third showed up when a second seed run was only p
 timestamp. The seed script created some events later in the day than the actual
 time. Once one of those became the marker, every real event before that time of day
 was skipped forever (symptom: "0 rows staged" even though Superset had new
-activity). *Fix:* the marker is never set later than the current time.
+activity). *Fix:* the marker (now `max(source_dttm)` of the stored raw rows) ignores rows dated later than the current time.
 
 **Bug 2: real clicks were not being counted.** The seed script writes rows like
 `action = 'dashboard_load'`. Superset 4.1.4's browser actually writes a generic
@@ -236,4 +238,8 @@ about the bank.
 - Superset 4.1.4 is pinned. Re-check the log event names if you upgrade.
 - The failure rate under-counts (browser rows only exist while the tab is open); see section 5.
 - Container logs still reach the pipeline through a manual pipe. A log platform is the follow-up.
-- The Iceberg sink assumes a single writer; compaction and snapshot expiry are manual until someone owns them.
+- Iceberg has no locks, so the single writer is a lease row (`etl_lock`); it is advisory (overlapping runs stay correct
+  because every write is an idempotent MERGE). The lab's Iceberg REST catalog uses SQLite, which can answer a simultaneous
+  commit with an HTTP 500 and then refuse further commits until `iceberg-rest` is restarted. A catalog with proper
+  optimistic concurrency (a JDBC/Postgres-backed or managed catalog) does not have this problem.
+- Compaction, snapshot expiry and orphan-file cleanup run from `etl/iceberg_maintenance.py`; confirm who owns them in the bank's platform.

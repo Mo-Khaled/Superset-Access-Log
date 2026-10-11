@@ -19,6 +19,7 @@ import iceberg_state  # noqa: E402
 import sync_logs  # noqa: E402
 
 iceberg_sink.time.sleep = lambda _s: None  # no real backoff in tests
+iceberg_state.time.sleep = lambda _s: None
 failures = []
 
 
@@ -110,8 +111,8 @@ def lease_handler(sql):
     if sql.startswith("MERGE INTO etl_lock"):
         state["merged"] = True
         return []
-    if sql.startswith("SELECT owner FROM etl_lock"):
-        return [(state["owner"],)]
+    if sql.startswith("SELECT owner"):
+        return [(state["owner"], state.get("live", True))]
     return []
 
 
@@ -126,11 +127,33 @@ check("lease refused when another run holds it", not lease.acquire())
 def race_handler(sql):
     if sql.startswith("MERGE INTO etl_lock"):
         raise RuntimeError("Failed to commit Iceberg update to table: monitoring.etl_lock")
-    return [("someone-else",)]
+    return [("someone-else", True)]
 
 
-check("lease: losing the commit race means 'not acquired', not a crash",
+check("lease: losing a commit race to a live lease means 'not acquired', not a crash",
       not iceberg_state.Lease(FakeConn(race_handler), "etl").acquire())
+
+# the catalog fails our commit while the lease is free: retry, then succeed
+attempts = {"n": 0}
+holder = iceberg_state.Lease(FakeConn(), "etl")
+
+
+def hiccup(sql):
+    if sql.startswith("MERGE INTO etl_lock"):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("Failed to commit the transaction during write: Service failed: 500")
+        return []
+    return [(holder.owner, True)] if attempts["n"] >= 3 else [("stale-owner", False)]
+
+
+holder.conn.handler = hiccup
+check("lease: a free lease is retried when our own commit fails", holder.acquire() and attempts["n"] == 3, str(attempts))
+
+stuck = FakeConn(lambda sql: (_ for _ in ()).throw(RuntimeError("Failed to commit"))
+                 if sql.startswith("MERGE") else [("stale-owner", False)])
+check("lease: gives up after a bounded number of tries", not iceberg_state.Lease(stuck, "etl").acquire(attempts=3)
+      and sum(1 for q in stuck.sql if q.startswith("MERGE")) == 3)
 
 
 def other_error(sql):

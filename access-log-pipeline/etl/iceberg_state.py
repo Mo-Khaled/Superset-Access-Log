@@ -8,13 +8,15 @@ ETL state that used to live in MySQL, rebuilt on Iceberg tables so Trino is the 
 
 How the lease stays safe without locks: Iceberg commits are atomic and serializable per table. Two runs that try to
 take the lock at the same moment issue the same MERGE; one commit wins, the other fails with a commit conflict and is
-treated as "not acquired". After either outcome the owner is read back, and only the run whose id is stored proceeds.
+retried. After every attempt the owner is read back, and only the run whose id is stored proceeds; a run that sees a live
+lease owned by someone else skips, one that sees a free lease (its own commit failed) tries again a few times.
 The lease expires on its own (ETL_LOCK_TTL_MINUTES), so a crashed run cannot block the pipeline forever; a long run
 renews it after every statement. If two runs ever do overlap anyway (a lease that expired mid-run, a scheduler that
 ignores its own concurrency policy), the data is still correct: every write is an idempotent MERGE and commit
 conflicts are retried (iceberg_sink.run_sql). The lease only avoids wasted work.
 """
 import os
+import random
 import time
 import uuid
 
@@ -37,8 +39,9 @@ class Lease:
     def _expiry(self):
         return "%s + INTERVAL '%d' MINUTE" % (NOW_UTC, self.ttl)
 
-    def acquire(self):
-        """True when this run now holds the lease."""
+    def acquire(self, attempts=4):
+        """True when this run now holds the lease. A refusal means another run holds an UNEXPIRED lease. If our own
+        commit failed while the lease was free (a catalog hiccup, or a commit race both sides lost), try again."""
         sql = (
             "MERGE INTO etl_lock t USING (SELECT %s AS lock_name, %s AS owner, %s AS acquired_at, %s AS expires_at) s\n"
             "ON t.lock_name = s.lock_name\n"
@@ -48,16 +51,22 @@ class Lease:
             "    VALUES (s.lock_name, s.owner, s.acquired_at, s.expires_at)"
             % (_q(self.name), _q(self.owner), NOW_UTC, self._expiry())
         )
-        try:
-            run_sql(self.conn, sql, retries=0)
-        except Exception as exc:  # noqa: BLE001
-            if not is_commit_conflict(exc):
-                raise
-            # another run committed first; the read-back below says whether it was us
-        rows = run_sql(self.conn, "SELECT owner FROM etl_lock WHERE lock_name = %s" % _q(self.name))
-        held = bool(rows) and rows[0][0] == self.owner
-        self._renewed_at = time.monotonic()
-        return held
+        for attempt in range(attempts):
+            try:
+                run_sql(self.conn, sql, retries=0)
+            except Exception as exc:  # noqa: BLE001
+                if not is_commit_conflict(exc):
+                    raise
+                # the commit failed; the read-back below says whether someone else holds the lease
+            rows = run_sql(self.conn, "SELECT owner, expires_at > %s FROM etl_lock WHERE lock_name = %s"
+                           % (NOW_UTC, _q(self.name)))
+            if rows and rows[0][0] == self.owner:
+                self._renewed_at = time.monotonic()
+                return True
+            if rows and rows[0][1]:
+                return False  # another run holds a live lease
+            time.sleep((1 + attempt) * (0.5 + random.random()))  # free, but our commit lost: try again
+        return False
 
     def renew(self, force=False):
         """Pushes the expiry forward. Called after every statement; throttled to one UPDATE a minute."""

@@ -31,6 +31,11 @@ docker compose -f lakehouse/docker-compose.yml exec trino trino --execute "selec
 ```
 
 Host ports: Trino `8085`, MinIO API `9102`, MinIO console `9103`, REST catalog `8183`. They differ from the main stack
-(`8089`, `13306`) and from the older `trino-query-history` project, so all can run together.
+(Superset on `8089`, Postgres on `15432`) and from the older `trino-query-history` project, so all can run together.
 
 Stop and remove everything, including the data: `docker compose -f lakehouse/docker-compose.yml down -v`.
+
+Lab limitation: the REST catalog keeps its metadata in SQLite. If two writers commit at the same instant it can answer with an
+HTTP 500 and then refuse commits until it is restarted (`docker compose -f lakehouse/docker-compose.yml restart iceberg-rest`).
+The pipeline's single-writer lease makes that rare, and a lease left behind by an interrupted run expires by itself after 30 minutes
+(or clear it now: `delete from iceberg.monitoring.etl_lock`). A production catalog with proper optimistic concurrency does not behave this way.
