@@ -14,7 +14,7 @@ own Trino through the `TRINO_*` settings, and nothing in this directory is deplo
 | `iceberg-rest` | `tabulario/iceberg-rest` | Iceberg REST catalog (SQLite on a volume) |
 | `trino` | `trinodb/trino` | SQL engine. Catalog `iceberg`, schema `monitoring` |
 
-No MySQL, no event listener, no custom image build.
+No event listener, no custom image build. The pipeline stores everything here: there is no other database.
 
 ## Use
 
@@ -24,7 +24,7 @@ docker compose -f lakehouse/docker-compose.yml up -d     # starts only the servi
 docker compose -f lakehouse/docker-compose.yml ps
 
 # main stack, joined to the lakehouse network (only what is needed)
-docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d postgres redis mysql superset pipeline
+docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d postgres redis superset pipeline
 
 # ask Trino something
 docker compose -f lakehouse/docker-compose.yml exec trino trino --execute "select version()"

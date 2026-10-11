@@ -1,12 +1,13 @@
 # Accessing Superset UI + the databases in DBeaver
 
 Quick reference for poking around this lab by hand: logging into Superset, and
-connecting DBeaver (or any other SQL client) to the two Postgres databases and the
-MySQL pipeline database.
+connecting DBeaver (or any other SQL client) to the two Postgres databases and to the
+Trino/Iceberg lakehouse that holds the pipeline's data.
 
 Bring the stack up first, if it isn't already:
 ```bash
-docker compose up -d --build
+docker compose -f lakehouse/docker-compose.yml up -d
+docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d --build
 docker compose logs -f superset-init   # wait for this to finish before using Superset
 ```
 
@@ -23,8 +24,8 @@ because that's already in use by another local project -- see `.env` /
 `docker-compose.yml` if you ever need to change it.)
 
 Once logged in: **Data > Databases** shows the registered connections --
-`examples` (the seeded Superset demo DB) and `Access Log Pipeline (MySQL)` (the
-pipeline's own MySQL database, registered automatically by
+`examples` (the seeded Superset demo DB) and `Lakehouse (Trino Iceberg)` (the
+pipeline's own Iceberg tables through Trino, registered automatically by
 `superset-bootstrap`/`access-log-pipeline/superset_bootstrap/bootstrap_dashboard.py`).
 **Dashboards** shows the example dashboards (`load_examples` seeds these), the
 native **Superset Usage Analytics** dashboard, plus anything the Task 2 repro
@@ -33,20 +34,20 @@ scripts created.
 ## 2. Usage dashboard
 
 **Dashboards -> Superset Usage Analytics**, inside Superset itself (same URL/login
-as above) -- a native Superset dashboard built on the MySQL pipeline tables below.
+as above) -- a native Superset dashboard built on the Iceberg pipeline tables below.
 (The project previously shipped a standalone dashboard on port 8091; it's been
 replaced by this native one, so there's nothing separate to log into.)
 
 ## 3. Databases in DBeaver
 
-Three separate database engines are involved. **Postgres** hosts two logical
+Two separate systems are involved. **Postgres** hosts two logical
 databases on the *same* server/port (Superset's own metadata, and Superset's
-`examples` content DB) -- **MySQL** is entirely separate, and is where our own
+`examples` content DB) -- **Trino over Iceberg** is entirely separate, and is where our own
 pipeline's tables live.
 
-By default `mysql`/`postgres` aren't published to the host (to avoid clashing with
-any local instances you may already be running on the standard 3306/5432 ports),
-so `docker-compose.yml` publishes them on non-standard host ports instead:
+Postgres isn't published on its standard 5432 port (to avoid clashing with any local
+instance you may already be running), so `docker-compose.yml` publishes it on a
+non-standard host port instead, and the lab Trino is on 8085:
 
 ### 3a. Postgres -- Superset's metadata DB
 
@@ -83,32 +84,31 @@ Bank data, COVID vaccine data, etc.), plus, if you've run the Task 2 repro, the
 `slow_query_demo` virtual dataset's underlying `pg_sleep(...)` query runs against
 *this* connection.
 
-### 3c. MySQL -- the access log pipeline's destination DB
+### 3c. Trino -- the access log pipeline's Iceberg tables
 
-A separate database engine from Superset's own metadata store -- only ever
-written to by `etl/sync_logs.py`, and read from by Superset itself (registered as
-a database connection) to power the **Superset Usage Analytics** dashboard.
+The pipeline's only data store. Written by the ETL scripts through Trino `MERGE`, and read by Superset (registered
+as a database connection) to power the **Superset Usage Analytics** and **Dashboard Reliability and Speed**
+dashboards. Use DBeaver's Trino driver.
 
 | Setting | Value |
 |---|---|
 | Host | `localhost` |
-| Port | `13306` |
-| Database | `access_log_pipeline` |
-| Username | `pipeline` |
-| Password | `pipeline_pw` |
+| Port | `8085` |
+| Catalog / schema | `iceberg` / `monitoring` |
+| Username | `pipeline` (no password in the lab) |
 
-(A `root` / `root_pw_lab_only` superuser also exists if you need it -- see
-`.env`.)
-
-Tables (see `access-log-pipeline/schema/*.sql` for full DDL + comments):
+Tables (see `access-log-pipeline/schema_iceberg/*.sql` for full DDL + comments):
 
 | Table | What it is |
 |---|---|
-| `raw_log_landing` | Staged raw JSON payloads pulled from `/api/v1/log/`, keyed by Superset's own log row id. Re-transform source of truth. |
-| `dim_users` | Superset users, denormalized from the raw logs. |
-| `dim_dashboards` | Dashboard id -> title lookup. |
-| `fact_access_events` | The cleaned event fact table -- one row per `dashboard_view` / `chart_view` / `export_csv` / etc. This is what the usage dashboard queries. |
-| `etl_sync_state` | Single-row high-water-mark the ETL uses to stay idempotent/incremental. |
+| `raw_log_landing` | Verbatim JSON of every row pulled from `/api/v1/log/`, keyed by Superset's own log row id. The watermark is read from it, and facts are rebuilt from it. |
+| `dim_users` | Superset users, from the user API. |
+| `dim_dashboards` | Dashboard id -> title and owners. |
+| `fact_access_events` | The cleaned event fact table -- one row per `dashboard_view` / `chart_view` / `export_csv` / etc., with `duration_ms` and `is_error` for chart loads. |
+| `fact_error_events` | One row per failure of any cause, with category, signature and raw message. |
+| `etl_run_log` | One row per ETL / ingest / maintenance run, with status. |
+| `etl_lock` | The single-writer lease. |
+| `vw_chart_failure_rate` | View: chart loads and failures per day and dashboard. |
 
 A quick sanity query once you're connected:
 ```sql
@@ -117,10 +117,10 @@ SELECT action, COUNT(*) FROM fact_access_events GROUP BY action ORDER BY 2 DESC;
 
 ## 4. Notes
 
-- All three connections use plaintext lab-only credentials from `.env` -- fine
+- The connections use plaintext lab-only credentials from `.env` -- fine
   here, never reuse them anywhere real (see the comment at the top of `.env`).
 - If DBeaver can't connect: confirm the containers are actually up and healthy
-  with `docker compose ps` -- Postgres/MySQL both have healthchecks, so "healthy"
+  with `docker compose ps` -- Postgres has a healthcheck, so "healthy"
   means the DB inside is actually accepting connections, not just that the
   container started.
 - `docker compose down` (no `-v`) stops everything but keeps all this data around

@@ -13,13 +13,13 @@ import glob
 import os
 import sys
 
-from iceberg_sink import CATALOG, SCHEMA, enabled, run_sql, trino_conn
+from iceberg_sink import CATALOG, SCHEMA, run_sql, trino_conn
 
 # Whether authorization denials (HTTP 401/403, "access denied") count as dashboard failures. Default false: a user
 # without access is expected behaviour, not a reliability problem. They are still reported as `authorization_denied`.
 AUTHZ_COUNTS_AS_FAILURE = os.environ.get("AUTHZ_COUNTS_AS_FAILURE", "false").strip().lower() in ("1", "true", "yes", "on")
 SQL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "schema_iceberg")
-TABLES = ["fact_access_events", "fact_error_events", "dim_dashboards"]
+TABLES = ["fact_access_events", "fact_error_events", "dim_dashboards", "dim_users", "raw_log_landing", "etl_run_log", "etl_lock"]
 
 
 def _statements(path):
@@ -30,9 +30,6 @@ def _statements(path):
 
 
 def main():
-    if not enabled():
-        print("ICEBERG_SINK_ENABLED is off; nothing to do")
-        return 0
     conn = trino_conn(schema=None)
     version = run_sql(conn, "SELECT node_version FROM system.runtime.nodes LIMIT 1")[0][0]
     print("Trino version: %s (catalog %s, schema %s)" % (version, CATALOG, SCHEMA))

@@ -1,9 +1,9 @@
 """
 Builds the "Dashboard Reliability and Speed" dashboard on top of the Iceberg tables (read through Trino).
-Called by bootstrap_dashboard.py when ICEBERG_SINK_ENABLED is on; idempotent like the rest of the bootstrap.
+Called by bootstrap_dashboard.py; idempotent like the rest of the bootstrap.
 
   * registers a Superset database connection to Trino (catalog `iceberg`)
-  * three virtual datasets, named so they cannot collide with the MySQL datasets of the usage dashboard
+  * three virtual datasets, named so they cannot collide with the datasets of the usage dashboard
       ice_failure_rate  : the day-grain view vw_chart_failure_rate (chart loads, failed loads, server kills)
       ice_chart_loads   : chart views with load time, joined to dashboard titles
       ice_chart_errors  : the error rows, joined to dashboard titles

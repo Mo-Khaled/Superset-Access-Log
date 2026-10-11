@@ -1,6 +1,6 @@
 """
-Ingests server-side failures of ANY cause from the Superset containers' logs into the error table
-(fact_error_events: Iceberg when ICEBERG_SINK_ENABLED is on, else the legacy MySQL table).
+Ingests server-side failures of ANY cause from the Superset containers' logs into the Iceberg error
+table (fact_error_events).
 
 We do not know in advance which errors production will produce, so nothing here is specific to one cause. Every
 signal Superset leaves behind is turned into a row with the raw message, a category and a signature (see
@@ -21,7 +21,8 @@ The pipeline container has no docker access, so pipe the logs in from the host (
         | docker compose exec -T pipeline python etl/ingest_container_errors.py
 
 Idempotent: every row has a stable dedupe_key; re-running fills in missing context but never duplicates.
-Single writer: shares the ETL's advisory lock, so it never overlaps an ETL run (Iceberg MERGE conflicts).
+Single writer: shares the ETL's lease (etl/iceberg_state.py), so it never overlaps an ETL run; commit conflicts that
+still happen are retried.
 """
 import hashlib
 import os
@@ -31,8 +32,9 @@ from datetime import datetime
 from urllib.parse import unquote
 
 import iceberg_sink
-from error_classify import classify, one_line, row_category_and_signature
-from sync_logs import acquire_etl_lock, mysql_conn
+import iceberg_state
+from error_classify import classify, one_line, row_category_and_signature, signature
+from sync_logs import LOCK_NAME
 
 TS = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
 GUNICORN_TIMEOUT = re.compile(rf"\[{TS} [+-]\d{{4}}\] \[\d+\] \[CRITICAL\] WORKER TIMEOUT \(pid:(\d+)\)")
@@ -192,54 +194,30 @@ def parse_lines(lines):
             )
 
 
-def _write_mysql(conn, rows):
-    """Legacy path (Iceberg off): the old MySQL table only has the basic columns."""
-    inserted = 0
-    with conn.cursor() as cur:
-        for r in rows:
-            cur.execute(
-                """
-                INSERT INTO fact_error_events
-                    (event_ts, source, error_type, reason, user_id, dashboard_id, chart_id, duration_ms, dedupe_key)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    reason       = VALUES(reason),
-                    user_id      = COALESCE(VALUES(user_id), user_id),
-                    dashboard_id = COALESCE(VALUES(dashboard_id), dashboard_id),
-                    chart_id     = COALESCE(VALUES(chart_id), chart_id)
-                """,
-                (r["event_ts"], r["source"], r["error_type"], r["reason"], r["user_id"], r["dashboard_id"],
-                 r["chart_id"], r["duration_ms"], r["dedupe_key"]),
-            )
-            inserted += 1 if cur.rowcount == 1 else 0
-    conn.commit()
-    return inserted
-
-
 def main():
-    conn = mysql_conn()
-    if not acquire_etl_lock(conn):
-        print("the ETL (or another ingest) holds the single-writer lock; skipping this run")
-        conn.close()
+    conn = iceberg_sink.trino_conn()
+    lease = iceberg_state.Lease(conn, LOCK_NAME)
+    rows = list(parse_lines(sys.stdin))  # parse before taking the lease: it needs no Trino
+    if not lease.acquire():
+        print("the ETL (or another ingest) holds the single-writer lease; skipping this run")
         return 0
-    rows = list(parse_lines(sys.stdin))
-    by_source = {}
-    for r in rows:
-        by_source[r["source"]] = by_source.get(r["source"], 0) + 1
-    clean = [{k: v for k, v in r.items() if k != "_matched"} for r in rows]
-    if iceberg_sink.enabled():
-        sink = iceberg_sink.IcebergSink()
-        for r in clean:
-            sink.add_error(r)
+    try:
+        by_source = {}
+        for r in rows:
+            by_source[r["source"]] = by_source.get(r["source"], 0) + 1
+        sink = iceberg_sink.IcebergSink(conn, on_progress=lease.renew)
+        for r in rows:
+            sink.add_error({k: v for k, v in r.items() if k != "_matched"})
         written = sink.flush()["errors"]
-        target = "iceberg"
-    else:
-        written = _write_mysql(conn, clean)
-        target = "mysql"
-    conn.close()
-    detail = ", ".join(f"{k}={v}" for k, v in sorted(by_source.items())) or "none"
-    print(f"server-side errors found: {len(rows)} ({detail}); sent to {target}: {written}")
-    return 0
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(by_source.items())) or "none"
+        iceberg_state.record_run(conn, "ingest", "ok", len(rows), written, detail)
+        print(f"server-side errors found: {len(rows)} ({detail}); sent to iceberg: {written}")
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        iceberg_state.record_run(conn, "ingest", "failed", len(rows), 0, str(exc))
+        raise
+    finally:
+        lease.release()
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ No fix is applied.
 Only the containers that are needed:
 ```
 docker compose -f lakehouse/docker-compose.yml up -d                       # minio, iceberg-rest, trino
-docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d postgres redis mysql superset pipeline
+docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d postgres redis superset pipeline
 docker compose exec -T pipeline python etl/iceberg_init.py                 # once
 docker compose exec -T pipeline python seed/generate_activity.py           # optional: 30 days of history incl. synthetic failures
 bash access-log-pipeline/run_etl.sh                                         # load it

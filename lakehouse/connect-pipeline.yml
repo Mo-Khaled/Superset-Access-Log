@@ -1,11 +1,10 @@
 # Override that lets the main stack reach the lab lakehouse. Use it together with the root compose file:
-#   docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d postgres redis mysql superset pipeline
+#   docker compose -f docker-compose.yml -f lakehouse/connect-pipeline.yml up -d postgres redis superset pipeline
 # Start the lakehouse first (it creates the shared network `scb-lakehouse`).
 #
 # Against the bank's real Trino, do not use this file: set TRINO_HOST/PORT/USER/CATALOG/SCHEMA
 # (and TLS/auth settings) in .env instead.
 x-trino-env: &trino-env
-  ICEBERG_SINK_ENABLED: "true"
   TRINO_HOST: trino
   TRINO_PORT: "8080"
   TRINO_USER: pipeline

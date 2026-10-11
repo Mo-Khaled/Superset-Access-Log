@@ -1,15 +1,6 @@
 import os
 
-import pymysql
 from superset.utils.log import DBEventLogger
-
-# Superset's MySQL engine spec imports the `MySQLdb` (mysqlclient) module directly
-# for a few code paths (notably virtual/SQL-defined dataset column introspection)
-# regardless of which driver the connection's SQLAlchemy URI actually uses. We
-# connect with pymysql (no C build deps, already installed -- see Dockerfile), so
-# register it as a drop-in `MySQLdb` to satisfy those `import MySQLdb` calls
-# instead of adding the heavier mysqlclient build toolchain to the image.
-pymysql.install_as_MySQLdb()
 
 # --- Metadata DB (Superset's own state: users, dashboards, charts, the `logs` table) ---
 SQLALCHEMY_DATABASE_URI = (
@@ -21,10 +12,10 @@ SQLALCHEMY_DATABASE_URI = (
 
 # `superset load_examples` loads its sample dashboards/charts into whatever this URI
 # points at. We keep it on the SAME Postgres instance as the metadata DB (a separate
-# logical database) so the "examples" data lives next to Superset's own state -- our
-# MySQL instance is reserved entirely for the *pipeline's* cleaned-up output, never
-# used as a Superset-registered source. This keeps the two concerns (Superset's
-# internal state vs. our analytics destination) unambiguously separate.
+# logical database) so the "examples" data lives next to Superset's own state -- the
+# pipeline's output lives in Iceberg (read through Trino), never in Superset's databases.
+# This keeps the two concerns (Superset's internal state vs. our analytics destination)
+# unambiguously separate.
 SQLALCHEMY_EXAMPLES_URI = (
     f"postgresql+psycopg2://{os.environ['POSTGRES_USER']}:"
     f"{os.environ['POSTGRES_PASSWORD']}@"
@@ -75,11 +66,11 @@ FEATURE_FLAGS = {
     "DASHBOARD_RBAC": False,
 }
 
-# --- TASK 1: lets superset_bootstrap/bootstrap_dashboard.py register the MySQL
-# pipeline DB as a Superset connection ---
+# --- TASK 1: lets superset_bootstrap/bootstrap_dashboard.py register the Trino
+# connection to the pipeline's Iceberg tables ---
 # Superset's SIP-15 "unsafe DB connection" guard (on by default) rejects adding a
 # database connection whose host resolves to a private/link-local IP -- which is
-# exactly what the `mysql` compose service's Docker-network hostname does. Safe to
+# exactly what the `trino` lab container's Docker-network hostname does. Safe to
 # disable here since this is a closed local lab network, not a multi-tenant deploy.
 PREVENT_UNSAFE_DB_CONNECTIONS = False
 

@@ -27,31 +27,6 @@ services:
       timeout: 5s
       retries: 10
 
-  mysql:
-    image: mysql:8.0
-    # PyMySQL (in the pipeline image) can't do caching_sha2_password without
-    # the `cryptography` package; simplest fix for a lab is the classic plugin.
-    command: ["--default-authentication-plugin=mysql_native_password"]
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
-    # Published on 13306 (not the default 3306) since the host already has MySQL
-    # instances bound to 3306/3307. Pipeline/dashboard containers still reach this
-    # over the compose network as `mysql:3306`. For ad-hoc DB client access
-    # (DBeaver etc.) -- see DBEAVER_GUIDE.md.
-    ports:
-      - "13306:3306"
-    volumes:
-      - mysql_data:/var/lib/mysql
-      - ./access-log-pipeline/schema:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   superset-init:
     build: ./docker/superset
     env_file: .env
@@ -121,17 +96,13 @@ services:
     environment:
       POSTGRES_HOST: postgres
       SUPERSET_BASE_URL: http://superset:8088
-      MYSQL_HOST: mysql
-    depends_on:
-      mysql:
-        condition: service_healthy
     volumes:
       - ./access-log-pipeline:/pipeline
       - ./intermittent-error/repro:/repro
       - ./intermittent-error/fix:/fix
 
   # One-shot: provisions the native Superset "Superset Usage Analytics" dashboard
-  # (MySQL database connection + datasets + charts) so it's ready the moment the
+  # (Trino connection + datasets + charts) so it's ready the moment the
   # stack comes up. Idempotent -- see superset_bootstrap/bootstrap_dashboard.py.
   # No compose healthcheck exists for `superset` today, so this polls /health
   # itself rather than depending on `condition: service_healthy`.
@@ -140,19 +111,15 @@ services:
     env_file: .env
     environment:
       SUPERSET_BASE_URL: http://superset:8088
-      MYSQL_HOST: mysql
     command: ["python", "superset_bootstrap/bootstrap_dashboard.py"]
     depends_on:
       superset-init:
         condition: service_completed_successfully
       superset:
         condition: service_started
-      mysql:
-        condition: service_healthy
     volumes:
       - ./access-log-pipeline:/pipeline
 
 volumes:
   postgres_data:
-  mysql_data:
   superset_home:

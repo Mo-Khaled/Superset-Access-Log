@@ -108,7 +108,7 @@ s = prs.slides.add_slide(BLANK)
 s.shapes.add_picture(LOGO, Inches(0.9), Inches(0.8), height=Inches(2.6))
 text(s, 0.9, 3.9, 11.5, 1.2, "Superset Dashboard Access Log", size=44, bold=True, color=BLUE)
 text(s, 0.9, 4.9, 11.5, 1.0, "From silent chart timeouts to a measured failure rate and load time", size=24, color=DARK)
-text(s, 0.9, 6.3, 11.5, 0.5, "End-to-end pipeline flow  |  Superset, MySQL, Trino, Iceberg", size=14, color=GREY)
+text(s, 0.9, 6.3, 11.5, 0.5, "End-to-end pipeline flow  |  Superset, Trino, Iceberg", size=14, color=GREY)
 
 # 2 Problem
 s = content("The problem: a silent, intermittent chart error", 2)
@@ -133,8 +133,8 @@ box(s, 0.6, 2.1, 2.3, 0.9, "Superset 4.1.4", "gunicorn :8089")
 box(s, 3.1, 2.1, 2.3, 0.9, "Postgres", "metadata + logs")
 box(s, 5.6, 2.1, 2.3, 0.9, "Redis", "cache + Celery")
 box(s, 0.6, 3.3, 2.3, 0.9, "Pipeline container", "ETL + seed + repro")
-box(s, 3.1, 3.3, 2.3, 0.9, "MySQL", "raw + facts + dims")
-box(s, 5.6, 3.3, 2.3, 0.9, "Celery worker/beat", "")
+box(s, 3.1, 3.3, 2.3, 0.9, "Superset Celery", "worker + beat")
+box(s, 5.6, 3.3, 2.3, 0.9, "Bootstrap", "dashboards (one-shot)")
 text(s, 0.6, 4.6, 6, 0.4, "Lakehouse stand-in (lakehouse/docker-compose.yml)", size=16, bold=True, color=BLUE)
 box(s, 0.6, 5.05, 2.3, 0.9, "MinIO", "warehouse bucket")
 box(s, 3.1, 5.05, 2.3, 0.9, "Iceberg REST", "catalog :8183")
@@ -144,7 +144,7 @@ arrow(s, 5.4, 5.5, 5.6, 5.5)
 bullets(s, 8.4, 2.1, 4.4, 4.5, [
     "Lakehouse is a stand-in for the bank's real Iceberg + Trino platform.",
     "connect-pipeline.yml joins pipeline, superset and bootstrap to the lakehouse network.",
-    "ICEBERG_SINK_ENABLED switches the Iceberg path on.",
+    "Iceberg is the only store for the pipeline: no MySQL.",
     "Superset gets a Trino connection via trino[sqlalchemy].",
 ], size=15)
 
@@ -161,7 +161,7 @@ for i, (t, sub) in enumerate(steps):
 bullets(s, 0.6, 4.1, 12.1, 2.8, [
     "run_etl.sh is one cycle, scheduled every 10 minutes: iceberg_init.py, sync_logs.py, then container logs piped into ingest_container_errors.py.",
     "Every write is idempotent (MERGE by key, stable dedupe_key), so re-reads never duplicate rows.",
-    "The watermark moves only after every write, including Iceberg, has succeeded.",
+    "Watermark = max(source_dttm) of raw_log_landing, written last, so it never gets ahead of the data.",
 ], size=17)
 
 # 5 Log sources
@@ -181,13 +181,13 @@ bullets(s, 4.9, 1.9, 7.9, 5, [
 s = content("ETL: incremental, safe, repeatable", 6)
 bullets(s, 0.6, 1.8, 6.0, 5, [
     "sync_logs.py pulls dttm > watermark, starting 24h earlier as a lookback.",
-    "A MySQL advisory lock keeps it to a single writer.",
-    "Raw JSON lands in raw_log_landing, then dims and fact tables.",
+    "A lease row in Iceberg (etl_lock) keeps it to a single writer; commit conflicts are retried.",
+    "Facts and dims are written first, raw_log_landing last; rows already stored are skipped.",
     "Browser load_chart with has_err becomes a fact_error_events row (source=browser).",
 ], size=17)
 bullets(s, 6.9, 1.8, 5.9, 5, [
     "Reconciliation: if Superset has more rows than the landing table, re-pull once with a warning.",
-    "--since and --full force a backfill; the watermark never moves backwards or into the future.",
+    "--since and --full force a backfill; future-dated rows never move the watermark.",
     "backfill_iceberg.py replays history through the same code and can reclassify old errors.",
     "acceptance_watermark.py tests rows 3h old, 10 days old and tomorrow.",
 ], size=17)
@@ -209,13 +209,13 @@ bullets(s, 0.6, 4.7, 12.1, 2.2, [
 s = content("Iceberg tables and the failure-rate view", 8)
 box(s, 0.6, 1.9, 3.9, 1.0, "fact_access_events", "day(event_ts), duration_ms, is_error")
 box(s, 0.6, 3.1, 3.9, 1.0, "fact_error_events", "source, category, signature, message")
-box(s, 0.6, 4.3, 3.9, 1.0, "dim_dashboards", "dashboard titles")
+box(s, 0.6, 4.3, 3.9, 1.0, "raw_log_landing + dims", "raw copy, dashboards, users")
 box(s, 5.2, 3.1, 3.0, 1.2, "vw_chart_failure_rate", "per day and dashboard", fill=BLUE, tcolor=WHITE, line=BLUE)
 arrow(s, 4.5, 2.4, 5.2, 3.5)
 arrow(s, 4.5, 3.6, 5.2, 3.7)
 arrow(s, 4.5, 4.8, 5.2, 3.9)
 bullets(s, 8.6, 1.9, 4.2, 5, [
-    "Parquet, format v2, MERGE INTO via iceberg_sink.py (2000-row chunks).",
+    "Parquet, format v2, MERGE INTO via iceberg_sink.py; daily compaction and snapshot expiry.",
     "chart_loads, rated_loads, failed_loads, server_kills, server_errors.",
     "Permission denials excluded unless AUTHZ_COUNTS_AS_FAILURE.",
     "Future-dated rows excluded.",
@@ -238,7 +238,7 @@ bullets(s, 6.9, 2.2, 5.9, 4.8, [
     "Load time = avg and p95 of browser duration_ms, successful loads only (a timeout always reads ~15s).",
     "Slow-load rate = successful loads above SLOW_LOAD_MS (5000).",
     "A lower bound: the browser reports only while the tab stays open.",
-    "Also: Superset Usage Analytics dashboard (MySQL) for views and users.",
+    "Also: Superset Usage Analytics dashboard (Iceberg) for views and users.",
 ], size=15)
 
 # 10 Demo
@@ -290,7 +290,7 @@ text(s, 8.2, 1.8, 4.6, 0.4, "Next steps for the bank platform", size=17, bold=Tr
 bullets(s, 8.2, 2.3, 4.6, 4.5, [
     "Confirm Trino version, permissions, TLS.",
     "Decide who owns Iceberg compaction.",
-    "Schedule via Kubernetes CronJob or Airflow; alert on etl_sync_state staleness.",
+    "Schedule via Kubernetes CronJob (concurrencyPolicy Forbid) or Airflow; alert on etl_run_log staleness.",
     "Automate container-log shipping (today a manual pipe).",
     "Populate source_ip (currently empty).",
 ], size=15)

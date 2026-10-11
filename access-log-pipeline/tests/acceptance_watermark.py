@@ -2,7 +2,7 @@
 Acceptance test for the ETL watermark: past-dated and future-dated log rows must never be silently skipped
 or silently counted.
 
-Run inside the pipeline container (it needs Postgres, MySQL, the Superset API and, for the Iceberg checks, Trino):
+Run inside the pipeline container (it needs Postgres, the Superset API and Trino):
     docker compose exec -T pipeline python tests/acceptance_watermark.py
 
 It inserts clearly labelled rows (referrer 'acceptance-test') straight into Superset's `logs` table, the same way
@@ -13,6 +13,7 @@ the seed script does, runs the real ETL after each step and checks where the row
   C  a row dated tomorrow                                           -> stored, but excluded from vw_chart_failure_rate
   D  a run with no new data                                         -> changes no Iceberg row, prints no warning
   E  Superset's rows before a cutoff <= raw_log_landing             -> nothing is missing
+  F  a second run started while one holds the lease                 -> skips, writes nothing
 
 Note: every API call the ETL makes is itself logged by Superset, so a run always finds a few NEW log rows
 (its own footprint). 'No new data' therefore means no new *fact* rows, not no new log rows.
@@ -29,7 +30,8 @@ import psycopg2
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "etl"))  # etl modules live there
 import iceberg_sink  # noqa: E402
 from superset_client import SupersetClient
-from sync_logs import api_log_total, landing_total, mysql_conn
+import iceberg_state  # noqa: E402
+from sync_logs import LOCK_NAME, api_log_total
 
 LABEL = "acceptance-test"
 failures = []
@@ -83,18 +85,11 @@ def iceberg_total(conn, table):
 
 
 def main():
-    if not iceberg_sink.enabled():
-        print("ICEBERG_SINK_ENABLED is off; the Iceberg checks need it. Aborting.")
-        return 2
     client = SupersetClient()
     tr = iceberg_sink.trino_conn()
 
     # a real dashboard and chart to hang the test rows on
-    mc = mysql_conn()
-    with mc.cursor() as cur:
-        cur.execute("SELECT dashboard_id FROM dim_dashboards ORDER BY dashboard_id LIMIT 1")
-        dash = cur.fetchone()["dashboard_id"]
-    mc.close()
+    dash = iceberg_sink.run_sql(tr, "SELECT dashboard_id FROM dim_dashboards ORDER BY dashboard_id LIMIT 1")[0][0]
     chart = 1
 
     print("0. baseline run so the watermark is current")
@@ -135,10 +130,19 @@ def main():
     # (Measuring after the run would race with the log rows the ETL's own last API calls create.)
     until = datetime.utcnow()
     run_etl()
-    mc = mysql_conn()
-    api, held = api_log_total(client, until), landing_total(mc, until)
-    mc.close()
+    api, held = api_log_total(client, until), iceberg_state.landing_total(tr, until)
     check("E: every Superset row dated before the cutoff is held", api <= held, f"api={api}, landing={held}")
+
+    print("F. a run started while another holds the lease")
+    holder = iceberg_state.Lease(tr, LOCK_NAME)
+    check("F: the first run takes the lease", holder.acquire())
+    before = iceberg_total(tr, "raw_log_landing")
+    out = run_etl()
+    check("F: the second run skips", "holds the single-writer lease" in out)
+    check("F: and wrote nothing", before == iceberg_total(tr, "raw_log_landing"))
+    holder.release()
+    out = run_etl()
+    check("F: once released, a run proceeds", "synced through" in out)
 
     print()
     print("ALL PASSED" if not failures else "FAILED: " + "; ".join(failures))

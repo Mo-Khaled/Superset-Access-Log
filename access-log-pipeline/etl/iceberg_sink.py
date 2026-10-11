@@ -1,26 +1,35 @@
 """
-Iceberg sink: writes the fact tables through Trino (`MERGE INTO`), so the pipeline needs no catalog or object
-store credentials of its own. Trino is the only dependency, and it already exists in the target architecture.
+Iceberg sink: the pipeline's only data store. Everything is written through Trino (`MERGE INTO`), so the pipeline
+needs no catalog or object store credentials of its own. Trino is the only dependency, and it already exists in the
+target architecture.
 
 Why MERGE: Iceberg has no unique keys, so idempotency is done in the statement. Re-reading the same log rows
 (lookback overlap, reconciliation rescans, retries after a failed run) must never create duplicates.
 
 Batching: rows are collected and written with one MERGE per table per chunk (ICEBERG_BATCH_ROWS, default 2000),
-not one MERGE per API page. Every MERGE is a snapshot, so many small ones mean many small files.
-Compaction (`ALTER TABLE ... EXECUTE optimize`) is a scheduled production task, see README.
+not one MERGE per API page. Every MERGE is a snapshot, so many small ones mean many small files. Raw log payloads are
+large, so they are chunked by size too (ICEBERG_RAW_BATCH_ROWS / ICEBERG_RAW_BATCH_CHARS) to stay under Trino's
+query length limit. Compaction is etl/iceberg_maintenance.py.
 
-Single writer: concurrent MERGEs on the same table conflict. sync_logs.py takes a MySQL advisory lock for this.
+Ordering is the consistency model (Trino cannot commit two tables atomically): facts and dimensions are written first,
+raw_log_landing LAST, and the watermark is read back from raw_log_landing. A crash anywhere leaves the watermark at
+the last fully written point, and the next run repeats the work, which is harmless because every statement is idempotent.
+
+Concurrent writers: Iceberg commits are optimistic, so two overlapping MERGEs on one table make one of them fail with a
+commit conflict. run_sql() retries those with backoff (safe, the statements are idempotent), and etl/iceberg_state.py
+adds a lease so overlapping runs normally never start.
 """
 import os
+import random
+import time
 from datetime import datetime
 
 CATALOG = os.environ.get("TRINO_CATALOG", "iceberg")
 SCHEMA = os.environ.get("TRINO_SCHEMA", "monitoring")
 BATCH_ROWS = int(os.environ.get("ICEBERG_BATCH_ROWS", "2000"))
-
-
-def enabled():
-    return os.environ.get("ICEBERG_SINK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+RAW_BATCH_ROWS = int(os.environ.get("ICEBERG_RAW_BATCH_ROWS", "300"))
+RAW_BATCH_CHARS = int(os.environ.get("ICEBERG_RAW_BATCH_CHARS", "400000"))  # Trino rejects statements over ~1,000,000 chars
+COMMIT_RETRIES = int(os.environ.get("ICEBERG_COMMIT_RETRIES", "6"))
 
 
 def trino_conn(schema=SCHEMA):
@@ -44,10 +53,26 @@ def trino_conn(schema=SCHEMA):
     )
 
 
-def run_sql(conn, sql):
-    cur = conn.cursor()
-    cur.execute(sql)
-    return cur.fetchall()  # must be consumed for the statement to finish
+def is_commit_conflict(exc):
+    """True for the error Trino raises when another writer committed to the same Iceberg table first."""
+    text = str(exc).lower()
+    return any(m in text for m in ("failed to commit", "commit failed", "concurrent", "stale table metadata",
+                                   "cannot commit", "iceberg_commit_error", "commitfailedexception"))
+
+
+def run_sql(conn, sql, retries=None):
+    """Runs a statement and returns its rows. Retries commit conflicts with exponential backoff and jitter: every
+    statement this pipeline sends is idempotent, so repeating one is always safe."""
+    attempts = (COMMIT_RETRIES if retries is None else retries) + 1
+    for attempt in range(attempts):
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            return cur.fetchall()  # must be consumed for the statement to finish
+        except Exception as exc:  # noqa: BLE001
+            if attempt + 1 >= attempts or not is_commit_conflict(exc):
+                raise
+            time.sleep(min(30.0, 2.0 ** attempt) * (0.5 + random.random()))
 
 
 # ---------- literal helpers (values are built into the statement; strings are escaped here) ----------
@@ -89,7 +114,11 @@ ERROR_SPEC = [
     ("error_category", "varchar"), ("error_signature", "varchar"), ("error_message", "varchar"),
     ("status_code", "integer"), ("request_path", "varchar"), ("request_id", "varchar"),
 ]
-DASH_SPEC = [("dashboard_id", "integer"), ("title", "varchar")]
+DASH_SPEC = [("dashboard_id", "integer"), ("title", "varchar"), ("owner_names", "varchar"),
+             ("created_on", "timestamp(6)"), ("changed_on", "timestamp(6)")]
+USER_SPEC = [("user_id", "integer"), ("username", "varchar"), ("first_name", "varchar"), ("last_name", "varchar"),
+             ("email", "varchar"), ("is_active", "boolean")]
+RAW_SPEC = [("source_log_id", "bigint"), ("source_dttm", "timestamp(6)"), ("payload", "varchar")]
 
 
 def _insert_cols(spec):
@@ -151,18 +180,54 @@ def merge_dashboards_sql(rows):
     return (
         "MERGE INTO dim_dashboards t USING (%s) s\n"
         "ON t.dashboard_id = s.dashboard_id\n"
-        "WHEN MATCHED AND t.title IS DISTINCT FROM s.title THEN UPDATE SET title = s.title\n"
+        "WHEN MATCHED AND (t.title IS DISTINCT FROM s.title OR t.owner_names IS DISTINCT FROM s.owner_names\n"
+        "              OR t.changed_on IS DISTINCT FROM s.changed_on) THEN UPDATE SET\n"
+        "    title = s.title, owner_names = s.owner_names, created_on = s.created_on, changed_on = s.changed_on\n"
         "WHEN NOT MATCHED THEN INSERT %s" % (_typed_source(rows, DASH_SPEC), _insert_cols(DASH_SPEC))
     )
 
 
-class IcebergSink:
-    """Collects rows and writes them in batches. Call flush() before advancing any watermark."""
+def merge_users_sql(rows):
+    return (
+        "MERGE INTO dim_users t USING (%s) s\n"
+        "ON t.user_id = s.user_id\n"
+        "WHEN MATCHED AND (t.username IS DISTINCT FROM s.username OR t.first_name IS DISTINCT FROM s.first_name\n"
+        "              OR t.last_name IS DISTINCT FROM s.last_name OR t.email IS DISTINCT FROM s.email\n"
+        "              OR t.is_active IS DISTINCT FROM s.is_active) THEN UPDATE SET\n"
+        "    username = s.username, first_name = s.first_name, last_name = s.last_name, email = s.email,\n"
+        "    is_active = s.is_active\n"
+        "WHEN NOT MATCHED THEN INSERT %s" % (_typed_source(rows, USER_SPEC), _insert_cols(USER_SPEC))
+    )
 
-    def __init__(self, conn=None):
+
+def merge_raw_sql(rows):
+    # source_dttm is part of the match so Iceberg can prune partitions; the same log row always has the same dttm.
+    cols = [c for c, _ in RAW_SPEC]
+    return (
+        "MERGE INTO raw_log_landing t USING (%s) s\n"
+        "ON t.source_log_id = s.source_log_id AND t.source_dttm = s.source_dttm\n"
+        "WHEN NOT MATCHED THEN INSERT (%s, ingested_at) VALUES (%s, CAST(current_timestamp AT TIME ZONE 'UTC' AS timestamp(6)))"
+        % (_typed_source(rows, RAW_SPEC), ", ".join(cols), ", ".join("s." + c for c in cols))
+    )
+
+
+class IcebergSink:
+    """Collects rows and writes them in batches. Call flush() before advancing any watermark.
+
+    Write order inside a run (see the module docstring): facts and dimensions first, raw_log_landing last. A raw chunk
+    is therefore only ever written after the facts and dimensions collected so far."""
+
+    def __init__(self, conn=None, on_progress=None):
         self.conn = conn or trino_conn()
-        self.access, self.errors, self.dashboards = {}, {}, {}
-        self.written = {"access": 0, "errors": 0, "dashboards": 0}
+        self.on_progress = on_progress  # called after every statement, e.g. to renew the single-writer lease
+        self.access, self.errors, self.dashboards, self.users, self.raw = {}, {}, {}, {}, {}
+        self.raw_chars = 0
+        self.written = {"access": 0, "errors": 0, "dashboards": 0, "users": 0, "raw": 0}
+
+    def _run(self, sql):
+        run_sql(self.conn, sql)
+        if self.on_progress:
+            self.on_progress()
 
     # rows are keyed so a duplicate inside one batch cannot insert twice
     def add_access(self, row):
@@ -178,32 +243,59 @@ class IcebergSink:
     def add_dashboard(self, row):
         self.dashboards[row["dashboard_id"]] = row
 
+    def add_user(self, row):
+        self.users[row["user_id"]] = row
+
+    def add_raw(self, row):
+        self.raw[row["source_log_id"]] = row
+        self.raw_chars += len(row["payload"])
+        if len(self.raw) >= RAW_BATCH_ROWS or self.raw_chars >= RAW_BATCH_CHARS:
+            self._flush_raw()
+
     def _flush_access(self):
         if self.access:
-            run_sql(self.conn, merge_access_sql(list(self.access.values())))
+            self._run(merge_access_sql(list(self.access.values())))
             self.written["access"] += len(self.access)
             self.access = {}
 
     def _flush_errors(self):
         if self.errors:
-            run_sql(self.conn, merge_error_sql(list(self.errors.values())))
+            self._run(merge_error_sql(list(self.errors.values())))
             self.written["errors"] += len(self.errors)
             self.errors = {}
+
+    def _flush_dims(self):
+        if self.dashboards:
+            self._run(merge_dashboards_sql(list(self.dashboards.values())))
+            self.written["dashboards"] += len(self.dashboards)
+            self.dashboards = {}
+        if self.users:
+            self._run(merge_users_sql(list(self.users.values())))
+            self.written["users"] += len(self.users)
+            self.users = {}
+
+    def _flush_raw(self):
+        if self.raw:
+            # everything derived from these log rows must be stored before the rows themselves are
+            self._flush_access()
+            self._flush_errors()
+            self._flush_dims()
+            self._run(merge_raw_sql(list(self.raw.values())))
+            self.written["raw"] += len(self.raw)
+            self.raw, self.raw_chars = {}, 0
 
     def reclassify(self, rows):
         """Apply new category/signature values to existing error rows, in batches. Returns rows sent."""
         sent = 0
         for i in range(0, len(rows), BATCH_ROWS):
             chunk = rows[i:i + BATCH_ROWS]
-            run_sql(self.conn, merge_reclassify_sql(chunk))
+            self._run(merge_reclassify_sql(chunk))
             sent += len(chunk)
         return sent
 
     def flush(self):
         self._flush_access()
         self._flush_errors()
-        if self.dashboards:
-            run_sql(self.conn, merge_dashboards_sql(list(self.dashboards.values())))
-            self.written["dashboards"] += len(self.dashboards)
-            self.dashboards = {}
+        self._flush_dims()
+        self._flush_raw()
         return dict(self.written)

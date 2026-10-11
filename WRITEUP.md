@@ -3,17 +3,17 @@
 Plain-language notes on the decisions behind this lab. Setup and commands are in
 [README.md](README.md); the demo script is in [intermittent-error/DEMO.md](intermittent-error/DEMO.md).
 
-## 1. How the MySQL data is organised
+## 1. How the data is organised
 
-Superset's activity is pulled through `LogRestApi` into MySQL like this:
+Superset's activity is pulled through `LogRestApi` into Iceberg tables (read through Trino). There is no other database in the pipeline:
 
 | Table | What it holds | Why it exists |
 |---|---|---|
 | `raw_log_landing` | The untouched JSON of every Superset log row | Superset may delete old logs. With a raw copy we can rebuild the other tables later if we find a bug or want a new metric. |
 | `fact_access_events` | One row per dashboard view, chart view or export | The usage numbers. |
-| `fact_error_events` | One row per failure, with its reason | See sections 3 and 5. Lives in Iceberg when the sink is on. |
+| `fact_error_events` | One row per failure, with its reason | See sections 3 and 5. |
 | `dim_users`, `dim_dashboards` | Names and owners | Keeps the fact table small and lets a renamed dashboard show its new title everywhere. |
-| `etl_sync_state` | "How far did we get last time" | Lets the ETL pick up where it stopped. Stored in MySQL, so any machine can run it. |
+| `etl_lock`, `etl_run_log` | The single-writer lease, and one row per run | The "how far did we get" marker is not stored: it is `max(source_dttm)` of `raw_log_landing`, so it cannot disagree with the data. The run log is what to alert on. Stored in Iceberg, so any machine can run the ETL. |
 
 Two choices worth knowing:
 
@@ -50,8 +50,8 @@ The user just sees an error.
 | Container output (`docker compose logs superset`) | Yes: `WORKER TIMEOUT` then `SIGKILL`. The "out of memory?" text is gunicorn boilerplate, not a real OOM. |
 | Superset's `logs` table, server side | No row for the killed request. |
 | Superset's `logs` table, browser side | Sometimes: a `load_chart` row with `has_err = true` and `timeout`, but only if the browser tab survives long enough to send it. |
-| `fact_access_events` (MySQL) | It reads the `logs` table, so it misses the server side. The browser row is even counted as a normal `chart_view`. |
-| `fact_error_events` (MySQL) | Yes, once the ETL has run: one `browser` row and one `gunicorn` row per failure (see below). |
+| `fact_access_events` | It reads the `logs` table, so it misses the server side. The browser row is even counted as a normal `chart_view`. |
+| `fact_error_events` | Yes, once the ETL has run: one `browser` row and one `gunicorn` row per failure (see below). |
 
 **Why it is "intermittent": the cache.** Query results are cached in Redis for 300s.
 A killed request never writes a result, so a cold load always fails. If anything
@@ -150,7 +150,7 @@ because the log API cannot filter by id. Capping the watermark at the current ti
 problem, but it does nothing for a row that is inserted *after* the watermark moves and carries an *older* `dttm`.
 That row never matches the filter again. We hit it: a second seed run inserted 7,225 rows and the ETL read 221. In real
 life the same thing happens with late browser flushes, clock skew between workers, ETL downtime and backfills.
-*Fix, three layers (all safe to repeat, because MySQL uses INSERT IGNORE and Iceberg uses MERGE):*
+*Fix, three layers (all safe to repeat, because every write is an Iceberg MERGE):*
 1. **Lookback.** Every pull starts 24 hours (configurable) before the watermark.
 2. **Reconciliation.** After a pull, the number of rows Superset dated before the start of the run (the `count` field of
    the list API with a `dttm` filter) is compared with the same window in `raw_log_landing`. If Superset has more, the
@@ -159,8 +159,8 @@ life the same thing happens with late browser flushes, clock skew between worker
    testing: the first reconciliation run found 6,909 skipped rows, and after a second seed 6,808.
 3. **`--since` / `--full`** for a deliberate backfill.
 
-The seed script also stopped generating timestamps later than now, which was the original cause. The watermark moves
-only after every write, including the Iceberg write, has succeeded. `tests/acceptance_watermark.py` checks a row dated
+The seed script also stopped generating timestamps later than now, which was the original cause. The watermark is
+derived from `raw_log_landing`, which is written last, so it can only advance after everything before it is stored. `tests/acceptance_watermark.py` checks a row dated
 3 hours ago, one 10 days ago, one tomorrow, an idempotent re-run, and that nothing is missing.
 
 A trap to remember: Superset 4.1.4's log list API silently ignores the filter operators `lte`, `le`, `gte` and `ge`
@@ -177,10 +177,15 @@ through Trino by Superset.
 - The ETL writes with Trino SQL (`MERGE INTO`), so the pipeline needs no catalog or object-store credentials of its own.
   A `MERGE ... WHEN NOT MATCHED` makes re-reading harmless, which Iceberg's lack of unique keys would otherwise prevent.
 - Rows are merged in chunks, one statement per table per chunk, not one per API page. Each MERGE is a snapshot, so many
-  small ones would mean many small files; compaction (`optimize`) is a scheduled production task.
-- One writer at a time: a MySQL advisory lock is shared by the ETL and the error ingest, because concurrent MERGEs conflict.
-- MySQL keeps what is small and mutable (raw copy, dimensions, the sync state, the existing usage facts). Errors and the
-  usage facts needed for the ratio live in Iceberg, partitioned by day.
+  small ones would mean many small files; raw payloads are chunked by size to stay under Trino's query length limit.
+- One writer at a time, without locks: Iceberg has none, so the ETL, error ingest, backfill and maintenance share a
+  lease row in `etl_lock`, taken with a `MERGE`. Iceberg's atomic commit decides a race: the loser fails with a commit
+  conflict, reads the owner back and skips. The lease expires on its own, so a crashed run cannot block the pipeline.
+  If two runs overlap anyway the data is still correct (idempotent MERGEs, commit conflicts retried with backoff).
+- Everything lives in Iceberg (facts partitioned by day). Trino cannot commit two tables together, so write order is the
+  consistency model: facts and dimensions first, `raw_log_landing` last; the watermark and the "already stored" check
+  both read it. Rows already stored are not sent again, so a quiet cycle writes almost nothing.
+- Compaction, snapshot expiry and orphan-file cleanup run from `etl/iceberg_maintenance.py` about once a day.
 - For the lab, `lakehouse/` is a self-contained stand-in (MinIO, Iceberg REST catalog, Trino) with its own compose file. It is
   not part of the target architecture.
 

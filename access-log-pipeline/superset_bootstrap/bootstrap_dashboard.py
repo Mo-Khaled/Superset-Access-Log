@@ -4,25 +4,25 @@ Idempotent bootstrap for the native Superset "Superset Usage Analytics" dashboar
 Runs once per `docker compose up` (as the one-shot `superset-bootstrap` service)
 after `superset-init` has created the admin user and the webserver is up. It:
 
-  1. Registers a Superset database connection pointing at the pipeline's own
-     MySQL database (the same one `etl/sync_logs.py` writes to -- no schema
-     changes, no new data processing logic).
+  1. Registers the Superset database connection to Trino (catalog `iceberg`), the
+     pipeline's only store (the same tables `etl/sync_logs.py` writes to).
   2. Registers the tables the usage dashboard needs as Superset datasets --
      three physical (`fact_access_events`, `dim_dashboards`, `dim_users`) and
-     three "virtual" (SQL-defined) ones that port the join/aggregation logic
-     that used to live in `access-log-pipeline/dashboard/queries.py` 1:1, since
-     Superset's chart builder can't express a join against a single dataset.
-  3. Creates the "Superset Usage Analytics" dashboard and the 7 required charts,
+     three "virtual" (SQL-defined) ones that hold the join/aggregation logic,
+     since Superset's chart builder can't express a join against a single dataset.
+  3. Creates the "Superset Usage Analytics" dashboard and its 7 charts,
      wiring each chart to that dashboard.
+  4. Builds the "Dashboard Reliability and Speed" dashboard (bootstrap_iceberg.py).
 
-Safe to re-run: every step is get-or-create (by name), matching the same
-idempotency philosophy as `etl/sync_logs.py` -- re-running this after the stack
+Safe to re-run: every step is get-or-create (by name) -- re-running this after the stack
 is already provisioned just confirms everything still exists and leaves it
-alone (or updates a chart's definition in place if it already exists).
+alone (or updates a chart's definition in place if it already exists). An install made
+when the pipeline still used MySQL is migrated: its datasets are pointed at Trino and the
+old MySQL connection is removed.
 
 Run standalone for debugging: `python superset_bootstrap/bootstrap_dashboard.py`
-(needs the same env vars as the ETL: SUPERSET_BASE_URL/SUPERSET_ADMIN_* and
-MYSQL_*; see .env / docker-compose.yml for the `superset-bootstrap` service).
+(needs SUPERSET_BASE_URL/SUPERSET_ADMIN_* and TRINO_*; see .env / docker-compose.yml
+for the `superset-bootstrap` service).
 """
 import json
 import os
@@ -32,92 +32,59 @@ import time
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from superset_client import SupersetClient  # noqa: E402
+import bootstrap_iceberg as ice  # noqa: E402
 
-# Deliberately does NOT contain "examples" -- intermittent-error/fix/apply_fix.py
-# looks up Superset's own "examples" database by a `database_name contains
-# 'examples'` filter, and this name must never collide with that lookup.
-DB_CONNECTION_NAME = "Access Log Pipeline (MySQL)"
+LEGACY_DB_CONNECTION_NAME = "Access Log Pipeline (MySQL)"  # removed by migrate_legacy_database()
+CATALOG, SCHEMA = ice.CATALOG, ice.SCHEMA
+T = f"{CATALOG}.{SCHEMA}"  # tables are fully qualified in the virtual datasets' SQL
 DASHBOARD_TITLE = "Superset Usage Analytics"
-
-MYSQL_HOST = os.environ["MYSQL_HOST"]
-MYSQL_PORT = os.environ.get("MYSQL_PORT", "3306")
-MYSQL_DATABASE = os.environ["MYSQL_DATABASE"]
-MYSQL_USER = os.environ["MYSQL_USER"]
-MYSQL_PASSWORD = os.environ["MYSQL_PASSWORD"]
-
-SQLALCHEMY_URI = (
-    f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PASSWORD}@"
-    f"{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DATABASE}"
-)
 
 SUPERSET_BASE_URL = os.environ.get("SUPERSET_BASE_URL", "http://superset:8088").rstrip("/")
 
-# --- Virtual dataset SQL -- ported from access-log-pipeline/dashboard/queries.py ---
-# (all-time grain; the per-window 7d/30d/90d/all selector from the old standalone
-# dashboard is superseded by Superset's own native dashboard-level time range
-# filter on the charts built against the physical fact_access_events table)
+# --- Virtual dataset SQL (Trino). All-time grain; the per-window selector is Superset's own dashboard-level time
+# range filter on the charts built against the physical fact_access_events table.
 
-MOST_VIEWED_DASHBOARDS_SQL = """
+MOST_VIEWED_DASHBOARDS_SQL = f"""
 SELECT
     f.dashboard_id AS dashboard_id,
-    COALESCE(d.title, CONCAT('Dashboard ', f.dashboard_id)) AS title,
+    COALESCE(d.title, 'Dashboard ' || CAST(f.dashboard_id AS varchar)) AS title,
     COUNT(*) AS view_count,
     COUNT(DISTINCT f.user_id) AS unique_viewers
-FROM fact_access_events f
-LEFT JOIN dim_dashboards d ON d.dashboard_id = f.dashboard_id
+FROM {T}.fact_access_events f
+LEFT JOIN {T}.dim_dashboards d ON d.dashboard_id = f.dashboard_id
 WHERE f.action = 'dashboard_view'
 GROUP BY f.dashboard_id, d.title
-ORDER BY view_count DESC
 """.strip()
 
-USER_ACTIVITY_SQL = """
+USER_ACTIVITY_SQL = f"""
 SELECT
     f.user_id AS user_id,
-    COALESCE(u.username, CONCAT('user_', f.user_id)) AS username,
+    COALESCE(u.username, 'user_' || CAST(f.user_id AS varchar)) AS username,
     COUNT(*) AS event_count,
     SUM(CASE WHEN f.action = 'dashboard_view' THEN 1 ELSE 0 END) AS dashboard_views,
     SUM(CASE WHEN f.action = 'chart_view' THEN 1 ELSE 0 END) AS chart_views,
     MAX(f.event_ts) AS last_active
-FROM fact_access_events f
-LEFT JOIN dim_users u ON u.user_id = f.user_id
+FROM {T}.fact_access_events f
+LEFT JOIN {T}.dim_users u ON u.user_id = f.user_id
 GROUP BY f.user_id, u.username
-ORDER BY event_count DESC
 """.strip()
 
-ZERO_VIEW_DASHBOARDS_SQL = """
+ZERO_VIEW_DASHBOARDS_SQL = f"""
 SELECT
     d.dashboard_id AS dashboard_id,
     d.title AS title,
-    d.owner_names AS owner_names,
+    COALESCE(d.owner_names, '') AS owner_names,
     COALESCE(v.view_count, 0) AS view_count
-FROM dim_dashboards d
+FROM {T}.dim_dashboards d
 LEFT JOIN (
     SELECT dashboard_id, COUNT(*) AS view_count
-    FROM fact_access_events
+    FROM {T}.fact_access_events
     WHERE action = 'dashboard_view'
     GROUP BY dashboard_id
 ) v ON v.dashboard_id = d.dashboard_id
 WHERE COALESCE(v.view_count, 0) <= 1
-ORDER BY view_count ASC, d.title ASC
-""".strip()
-
-# Failures recorded by etl/sync_logs.py (browser) and etl/ingest_container_errors.py
-# (gunicorn). Shown newest first with the dashboard title and username resolved.
-CHART_ERRORS_SQL = """
-SELECT
-    e.event_ts AS event_ts,
-    e.source AS source,
-    e.error_type AS error_type,
-    COALESCE(d.title, '') AS dashboard,
-    e.chart_id AS chart_id,
-    COALESCE(u.username, '') AS username,
-    e.duration_ms AS duration_ms,
-    e.reason AS reason
-FROM fact_error_events e
-LEFT JOIN dim_dashboards d ON d.dashboard_id = e.dashboard_id
-LEFT JOIN dim_users u ON u.user_id = e.user_id
-ORDER BY e.event_ts DESC
 """.strip()
 
 # Explicit column fallback for the virtual datasets above -- see
@@ -126,23 +93,23 @@ ORDER BY e.event_ts DESC
 # happens to return zero rows, which `vw_zero_view_dashboards` can easily do).
 # Tuples are (column_name, sql type, is_dttm).
 MOST_VIEWED_DASHBOARDS_COLUMNS = [
-    ("dashboard_id", "BIGINT", False),
-    ("title", "VARCHAR(500)", False),
+    ("dashboard_id", "INTEGER", False),
+    ("title", "VARCHAR", False),
     ("view_count", "BIGINT", False),
     ("unique_viewers", "BIGINT", False),
 ]
 USER_ACTIVITY_COLUMNS = [
-    ("user_id", "INT", False),
-    ("username", "VARCHAR(255)", False),
+    ("user_id", "INTEGER", False),
+    ("username", "VARCHAR", False),
     ("event_count", "BIGINT", False),
     ("dashboard_views", "BIGINT", False),
     ("chart_views", "BIGINT", False),
-    ("last_active", "DATETIME", True),
+    ("last_active", "TIMESTAMP(6)", True),
 ]
 ZERO_VIEW_DASHBOARDS_COLUMNS = [
-    ("dashboard_id", "INT", False),
-    ("title", "VARCHAR(500)", False),
-    ("owner_names", "VARCHAR(500)", False),
+    ("dashboard_id", "INTEGER", False),
+    ("title", "VARCHAR", False),
+    ("owner_names", "VARCHAR", False),
     ("view_count", "BIGINT", False),
 ]
 
@@ -173,23 +140,26 @@ def get_one(client, path, rison_filter):
 
 
 def get_or_create_database(client):
-    existing = get_one(
-        client,
-        "/api/v1/database/",
-        f"(filters:!((col:database_name,opr:eq,value:'{DB_CONNECTION_NAME}')))",
-    )
-    if existing:
-        print(f"database connection '{DB_CONNECTION_NAME}' already exists (id={existing['id']})")
-        return existing["id"]
-    payload = {
-        "database_name": DB_CONNECTION_NAME,
-        "sqlalchemy_uri": SQLALCHEMY_URI,
-        "expose_in_sqllab": True,
-    }
-    resp = client.post("/api/v1/database/", json=payload)
-    db_id = resp.json()["id"]
-    print(f"created database connection '{DB_CONNECTION_NAME}' (id={db_id})")
-    return db_id
+    return ice.get_or_create_trino_database(client, sys.modules[__name__])
+
+
+def migrate_legacy_database(client, new_db_id):
+    """Installs made when the pipeline used MySQL still have datasets bound to that connection. Point them at Trino,
+    then drop the old connection. Best effort: a failure here leaves the old connection in place, harmlessly."""
+    old = get_one(client, "/api/v1/database/",
+                  f"(filters:!((col:database_name,opr:eq,value:'{LEGACY_DB_CONNECTION_NAME}')))")
+    if not old:
+        return
+    try:
+        resp = client.get(f"/api/v1/dataset/?q=(filters:!((col:database,opr:rel_o_m,value:{old['id']})),page_size:100)")
+        for d in resp.json().get("result", []):
+            client.session.put(f"{client.base_url}/api/v1/dataset/{d['id']}",
+                               json={"database_id": new_db_id, "schema": SCHEMA}, timeout=60).raise_for_status()
+            print(f"moved dataset '{d['table_name']}' from the MySQL connection to Trino")
+        client.session.delete(f"{client.base_url}/api/v1/database/{old['id']}", timeout=60).raise_for_status()
+        print(f"removed the old '{LEGACY_DB_CONNECTION_NAME}' connection")
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: could not migrate the old MySQL connection ({exc}); remove it by hand in Superset")
 
 
 def _dataset_columns(client, dataset_id):
@@ -237,16 +207,6 @@ def _ensure_virtual_dataset_columns(client, dataset_id, table_name, column_defs)
         f"{client.base_url}/api/v1/dataset/{dataset_id}", json=payload, timeout=60
     ).raise_for_status()
     print(f"explicitly set columns for '{table_name}' (id={dataset_id}) -- refresh returned none")
-CHART_ERRORS_COLUMNS = [
-    ("event_ts", "DATETIME", True),
-    ("source", "VARCHAR(20)", False),
-    ("error_type", "VARCHAR(50)", False),
-    ("dashboard", "VARCHAR(500)", False),
-    ("chart_id", "INT", False),
-    ("username", "VARCHAR(255)", False),
-    ("duration_ms", "INT", False),
-    ("reason", "VARCHAR(500)", False),
-]
 
 
 def get_or_create_dataset(client, db_id, table_name, sql=None, column_defs=None):
@@ -257,6 +217,11 @@ def get_or_create_dataset(client, db_id, table_name, sql=None, column_defs=None)
     )
     if existing:
         dataset_id = existing["id"]
+        # keep the dataset's SQL and connection in step with this file (an older install pointed at MySQL)
+        update = {"database_id": db_id, "schema": SCHEMA}
+        if sql:
+            update["sql"] = sql
+        client.session.put(f"{client.base_url}/api/v1/dataset/{dataset_id}", json=update, timeout=60).raise_for_status()
         if sql:
             _refresh_dataset_columns(client, dataset_id)
             if column_defs:
@@ -265,7 +230,7 @@ def get_or_create_dataset(client, db_id, table_name, sql=None, column_defs=None)
         return dataset_id
     payload = {
         "database": db_id,
-        "schema": MYSQL_DATABASE,
+        "schema": SCHEMA,
         "table_name": table_name,
     }
     if sql:
@@ -454,30 +419,6 @@ def zero_view_dashboards_params(dataset_id):
     return p
 
 
-def chart_errors_params(dataset_id):
-    p = _base_params(dataset_id, "table")
-    p.update(
-        {
-            "query_mode": "raw",
-            "all_columns": [
-                "event_ts",
-                "source",
-                "error_type",
-                "dashboard",
-                "chart_id",
-                "username",
-                "duration_ms",
-                "reason",
-            ],
-            "order_by_cols": ['["event_ts", false]'],
-            "row_limit": 100,
-            "server_pagination": False,
-            "time_range": "No filter",
-        }
-    )
-    return p
-
-
 def export_activity_params(dataset_id):
     p = _base_params(dataset_id, "table")
     p.update(
@@ -513,8 +454,10 @@ def main():
     client = SupersetClient()
 
     db_id = get_or_create_database(client)
+    migrate_legacy_database(client, db_id)
 
     fact_id = get_or_create_dataset(client, db_id, "fact_access_events")
+    ice.mark_time_column(client, sys.modules[__name__], fact_id, "event_ts")  # Superset offers day/week/month grains
     get_or_create_dataset(client, db_id, "dim_dashboards")
     get_or_create_dataset(client, db_id, "dim_users")
 
@@ -530,16 +473,6 @@ def main():
         client, db_id, "vw_zero_view_dashboards",
         sql=ZERO_VIEW_DASHBOARDS_SQL, column_defs=ZERO_VIEW_DASHBOARDS_COLUMNS,
     )
-
-    # With the Iceberg sink on, errors live in Iceberg and the "Chart Load Errors" chart is built by
-    # bootstrap_iceberg.py on the "Dashboard Reliability and Speed" dashboard instead.
-    iceberg_on = os.environ.get("ICEBERG_SINK_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
-    chart_errors_id = None
-    if not iceberg_on:
-        chart_errors_id = get_or_create_dataset(
-            client, db_id, "vw_chart_errors",
-            sql=CHART_ERRORS_SQL, column_defs=CHART_ERRORS_COLUMNS,
-        )
 
     dashboard_id = get_or_create_dashboard(client, DASHBOARD_TITLE)
 
@@ -571,15 +504,9 @@ def main():
         client, "Export Activity", fact_id, "table",
         export_activity_params(fact_id), dashboard_id,
     )
-    if chart_errors_id is not None:
-        get_or_create_chart(
-            client, "Chart Load Errors", chart_errors_id, "table",
-            chart_errors_params(chart_errors_id), dashboard_id,
-        )
 
-    if iceberg_on:
-        import bootstrap_iceberg  # noqa: E402  (same directory)
-        bootstrap_iceberg.main(client, sys.modules[__name__])  # pass this module's helpers (get_or_create_*)
+    # failure rate, load time, errors by category: a second dashboard on the same Trino connection
+    ice.main(client, sys.modules[__name__])
 
     print(
         f"Superset bootstrap complete -- open '{DASHBOARD_TITLE}' at "

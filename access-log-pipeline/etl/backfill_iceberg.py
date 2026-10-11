@@ -1,111 +1,74 @@
 """
-One-off: fills Iceberg from what MySQL already holds, so history is not lost when the Iceberg sink is switched on.
+Rebuilds Iceberg facts from what Iceberg already holds. Use it after changing how log rows are classified
+(sync_logs.build_event_rows, error_classify.py), so history follows the new rules.
 
-  * access and browser-error rows are rebuilt by replaying raw_log_landing through the SAME code the ETL uses
-    (sync_logs.build_event_rows), so duration_ms and is_error are filled for old rows too
-  * gunicorn error rows cannot be derived from raw_log_landing, so they are copied from MySQL fact_error_events
-    (their category, signature and message are derived from the stored reason)
-  * dim_dashboards is copied from MySQL
+  python etl/backfill_iceberg.py              replay raw_log_landing through the SAME code the ETL uses
+                                              (sync_logs.build_event_rows) and MERGE the access and browser-error rows
+  python etl/backfill_iceberg.py --reclassify recompute category and signature for EVERY stored error row with the
+                                              current rules, and update the rows whose values differ
 
-Idempotent (MERGE), so it is safe to run more than once. Takes the same single-writer lock as the ETL.
-    python etl/backfill_iceberg.py
+Idempotent (MERGE), so it is safe to run more than once. Takes the same single-writer lease as the ETL.
+Server-side rows (gunicorn, server, celery) cannot be rebuilt from raw_log_landing, so only --reclassify touches them.
 """
 import json
 import sys
 
 import iceberg_sink
-from error_classify import classify, row_category_and_signature, signature
-from sync_logs import acquire_etl_lock, build_event_rows, mysql_conn
+import iceberg_state
+from error_classify import row_category_and_signature
+from sync_logs import LOCK_NAME, build_event_rows
 
 
-def reclassify():
+def reclassify(conn, sink):
     """Recompute category and signature for EVERY stored error row with the current rules (error_classify.py), and
     update the rows that differ. Run this after changing the rules."""
-    if not iceberg_sink.enabled():
-        print("ICEBERG_SINK_ENABLED is off; nothing to do")
-        return 0
-    conn = mysql_conn()
-    if not acquire_etl_lock(conn):
-        print("the ETL holds the single-writer lock; try again when it has finished")
-        return 1
-    sink = iceberg_sink.IcebergSink()
-    cur = sink.conn.cursor()
-    cur.execute("SELECT dedupe_key, event_ts, source, error_type, status_code, request_path, error_message, reason "
-                "FROM fact_error_events")
     rows = []
-    for dedupe_key, ts, source, error_type, status, path, message, reason in cur.fetchall():
+    for dedupe_key, ts, source, error_type, status, path, message, reason in iceberg_sink.run_sql(
+        conn,
+        "SELECT dedupe_key, event_ts, source, error_type, status_code, request_path, error_message, reason "
+        "FROM fact_error_events",
+    ):
         category, sig = row_category_and_signature(source, error_type, status, path, message or reason)
         rows.append({"dedupe_key": dedupe_key, "event_ts": ts, "error_category": category, "error_signature": sig})
     sent = sink.reclassify(rows)
-    conn.close()
     print(f"recomputed category and signature for {sent} error rows; rows whose values changed were updated")
     return 0
 
 
-def main():
-    if "--reclassify" in sys.argv:
-        return reclassify()
-    if not iceberg_sink.enabled():
-        print("ICEBERG_SINK_ENABLED is off; nothing to do")
-        return 0
-    conn = mysql_conn()
-    if not acquire_etl_lock(conn):
-        print("the ETL holds the single-writer lock; try again when it has finished")
-        return 1
-    sink = iceberg_sink.IcebergSink()
+def replay(_conn, sink):
+    """Rebuilds access and browser-error facts from raw_log_landing."""
     replayed = 0
-    with conn.cursor() as cur:
-        cur.execute("SELECT source_log_id, payload FROM raw_log_landing ORDER BY source_log_id")
-        for r in cur.fetchall():
-            row = json.loads(r["payload"]) if isinstance(r["payload"], str) else r["payload"]
-            row["id"] = r["source_log_id"]
+    cur = iceberg_sink.trino_conn().cursor()  # its own connection: it stays open while the sink writes
+    cur.execute("SELECT source_log_id, payload FROM raw_log_landing ORDER BY source_log_id")
+    while True:
+        batch = cur.fetchmany(2000)
+        if not batch:
+            break
+        for log_id, payload in batch:
+            row = json.loads(payload)
+            row["id"] = log_id
             access, error = build_event_rows(row)
             if access is not None:
                 sink.add_access(access)
             if error is not None:
                 sink.add_error(error)
             replayed += 1
-
-        cur.execute(
-            "SELECT dedupe_key, event_ts, source, error_type, reason, user_id, dashboard_id, chart_id, "
-            "duration_ms, raw_log_id FROM fact_error_events WHERE source = 'gunicorn'"
-        )
-        gunicorn = 0
-        for r in cur.fetchall():
-            row = dict(r)
-            # these predate the cause-agnostic columns: derive them from the stored reason
-            category, sig = row_category_and_signature("gunicorn", "worker_timeout", None, None, row["reason"])
-            row.update(error_category=category, error_signature=sig, error_message=row["reason"])
-            sink.add_error(row)
-            gunicorn += 1
-
-        cur.execute("SELECT dashboard_id, title FROM dim_dashboards")
-        for r in cur.fetchall():
-            sink.add_dashboard({"dashboard_id": r["dashboard_id"], "title": r["title"]})
-
     written = sink.flush()
-
-    # Last step, any source: classify rows that still have no category (written before the columns existed, and not
-    # re-derivable from raw_log_landing or MySQL).
-    cols = ["dedupe_key", "event_ts", "source", "error_type", "reason", "user_id", "dashboard_id", "chart_id",
-            "duration_ms", "raw_log_id"]
-    tcur = sink.conn.cursor()
-    tcur.execute("SELECT %s FROM fact_error_events WHERE error_category IS NULL" % ", ".join(cols))
-    for values in tcur.fetchall():
-        row = dict(zip(cols, values))
-        text = row["reason"] or ""
-        category, sig = row_category_and_signature(row["source"], row["error_type"], None, None, text)
-        row.update(error_category=category, error_signature=sig, error_message=text)
-        sink.add_error(row)
-        gunicorn += 0  # (counted separately below)
-    classified = sink.flush()["errors"] - written["errors"]
-    written = dict(written, errors=written["errors"] + classified)
-    conn.close()
-    print(
-        f"replayed {replayed} raw log rows and {gunicorn} gunicorn error rows; merged into Iceberg: "
-        f"{written['access']} access, {written['errors']} errors, {written['dashboards']} dashboards"
-    )
+    print(f"replayed {replayed} raw log rows; merged into Iceberg: {written['access']} access, {written['errors']} errors")
     return 0
+
+
+def main():
+    conn = iceberg_sink.trino_conn()
+    lease = iceberg_state.Lease(conn, LOCK_NAME)
+    if not lease.acquire():
+        print("the ETL holds the single-writer lease; try again when it has finished")
+        return 1
+    try:
+        sink = iceberg_sink.IcebergSink(on_progress=lease.renew)
+        return reclassify(conn, sink) if "--reclassify" in sys.argv else replay(conn, sink)
+    finally:
+        lease.release()
 
 
 if __name__ == "__main__":
