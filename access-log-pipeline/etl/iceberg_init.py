@@ -15,6 +15,9 @@ import sys
 
 from iceberg_sink import CATALOG, SCHEMA, enabled, run_sql, trino_conn
 
+# Whether authorization denials (HTTP 401/403, "access denied") count as dashboard failures. Default false: a user
+# without access is expected behaviour, not a reliability problem. They are still reported as `authorization_denied`.
+AUTHZ_COUNTS_AS_FAILURE = os.environ.get("AUTHZ_COUNTS_AS_FAILURE", "false").strip().lower() in ("1", "true", "yes", "on")
 SQL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "schema_iceberg")
 TABLES = ["fact_access_events", "fact_error_events", "dim_dashboards"]
 
@@ -22,7 +25,8 @@ TABLES = ["fact_access_events", "fact_error_events", "dim_dashboards"]
 def _statements(path):
     # drop whole-line and trailing "-- comments" first, so a ';' inside a comment cannot split a statement
     lines = [l.split("--", 1)[0] for l in open(path, encoding="utf-8").read().splitlines()]
-    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+    text = "\n".join(lines).replace("{{AUTHZ_COUNTS}}", "true" if AUTHZ_COUNTS_AS_FAILURE else "false")
+    return [s.strip() for s in text.split(";") if s.strip()]
 
 
 def main():
@@ -58,7 +62,9 @@ def main():
     if bad:
         print("ERROR: tables not format-version 2 (MERGE needs it): %s" % ", ".join(bad), file=sys.stderr)
         return 1
-    print("Iceberg objects ready; tables are format-version 2; view %s" % ("created" if view_ok else "NOT created"))
+    print("Iceberg objects ready; tables are format-version 2; view %s; authorization denials %s" % (
+        "created" if view_ok else "NOT created",
+        "count as failures" if AUTHZ_COUNTS_AS_FAILURE else "are reported separately"))
     return 0
 
 

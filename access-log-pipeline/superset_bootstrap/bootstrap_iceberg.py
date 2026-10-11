@@ -32,8 +32,8 @@ DASHBOARD_TITLE = "Dashboard Reliability and Speed"
 FAILURE_RATE_SQL = f"SELECT * FROM {CATALOG}.{SCHEMA}.vw_chart_failure_rate"
 FAILURE_RATE_COLUMNS = [
     ("day", "DATE", True), ("dashboard_id", "INTEGER", False), ("title", "VARCHAR", False),
-    ("chart_loads", "BIGINT", False), ("failed_loads", "BIGINT", False), ("server_kills", "BIGINT", False),
-    ("server_errors", "BIGINT", False),
+    ("chart_loads", "BIGINT", False), ("rated_loads", "BIGINT", False), ("failed_loads", "BIGINT", False),
+    ("authorization_denied", "BIGINT", False), ("server_kills", "BIGINT", False), ("server_errors", "BIGINT", False),
 ]
 
 CHART_LOADS_SQL = f"""
@@ -50,30 +50,44 @@ CHART_LOADS_COLUMNS = [
 ]
 
 CHART_ERRORS_SQL = f"""
+WITH reported AS (
+    -- a server/gunicorn/celery error is 'also_in_browser' when a browser error for the same chart (same user when both
+    -- are known) happened within 30 seconds: the same failure seen from both sides, to be counted once
+    SELECT s.dedupe_key, count(b.dedupe_key) > 0 AS also_in_browser
+    FROM {CATALOG}.{SCHEMA}.fact_error_events s
+    LEFT JOIN {CATALOG}.{SCHEMA}.fact_error_events b
+      ON b.source = 'browser' AND s.source <> 'browser' AND b.chart_id = s.chart_id
+     AND b.event_ts BETWEEN s.event_ts - INTERVAL '30' SECOND AND s.event_ts + INTERVAL '30' SECOND
+     AND (b.user_id = s.user_id OR b.user_id IS NULL OR s.user_id IS NULL)
+    GROUP BY s.dedupe_key
+)
 SELECT e.event_ts, e.source, coalesce(e.error_category, 'unclassified') AS error_category, e.error_type,
        coalesce(e.error_signature, e.error_type) AS error_signature,
        coalesce(e.error_message, e.reason) AS error_message, e.status_code, e.request_path,
-       coalesce(d.title, '') AS dashboard, e.chart_id, e.user_id, e.duration_ms, e.reason
+       coalesce(d.title, '') AS dashboard, e.chart_id, e.user_id, e.duration_ms, e.reason,
+       coalesce(r.also_in_browser, false) AS also_in_browser
 FROM {CATALOG}.{SCHEMA}.fact_error_events e
 LEFT JOIN {CATALOG}.{SCHEMA}.dim_dashboards d ON d.dashboard_id = e.dashboard_id
+LEFT JOIN reported r ON r.dedupe_key = e.dedupe_key
 """.strip()
 CHART_ERRORS_COLUMNS = [
     ("event_ts", "TIMESTAMP(6)", True), ("source", "VARCHAR", False), ("error_category", "VARCHAR", False),
     ("error_type", "VARCHAR", False), ("error_signature", "VARCHAR", False), ("error_message", "VARCHAR", False),
     ("status_code", "INTEGER", False), ("request_path", "VARCHAR", False), ("dashboard", "VARCHAR", False),
     ("chart_id", "INTEGER", False), ("user_id", "INTEGER", False), ("duration_ms", "INTEGER", False),
-    ("reason", "VARCHAR", False),
+    ("reason", "VARCHAR", False), ("also_in_browser", "BOOLEAN", False),
 ]
 
 # ---- metrics (SQL expressions Superset wraps in its own time-grain GROUP BY) ----
 FAILURE_RATE = {
     "expressionType": "SQL",
-    "sqlExpression": "SUM(failed_loads) * 1.0 / NULLIF(SUM(chart_loads), 0)",
+    "sqlExpression": "SUM(failed_loads) * 1.0 / NULLIF(SUM(rated_loads), 0)",
     "label": "Failure rate",
 }
 CHART_LOADS = {"expressionType": "SQL", "sqlExpression": "SUM(chart_loads)", "label": "Chart loads"}
 FAILED_LOADS = {"expressionType": "SQL", "sqlExpression": "SUM(failed_loads)", "label": "Failed loads"}
 SERVER_KILLS = {"expressionType": "SQL", "sqlExpression": "SUM(server_kills)", "label": "Server kills"}
+AUTHZ_DENIED = {"expressionType": "SQL", "sqlExpression": "SUM(authorization_denied)", "label": "Authorization denied"}
 SERVER_ERRORS = {"expressionType": "SQL", "sqlExpression": "SUM(server_errors)", "label": "Server errors"}
 # error discovery: group by what the error SAYS, so an unknown cause shows up as a growing signature
 ERRORS = {"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "Errors"}
@@ -88,6 +102,8 @@ SLOW_RATE = {
     "label": f"Slow loads (> {SLOW_LOAD_MS} ms)",
 }
 LOADS_COUNT = {"expressionType": "SQL", "sqlExpression": "COUNT(*)", "label": "Successful loads"}
+# each failure once: drop server-side rows the browser also reported
+DISTINCT_FAILURES = {"clause": "WHERE", "expressionType": "SQL", "sqlExpression": "NOT also_in_browser"}
 OK_LOADS_ONLY = {
     "clause": "WHERE", "expressionType": "SQL", "sqlExpression": "is_error = false AND duration_ms IS NOT NULL",
 }
@@ -127,8 +143,8 @@ def _raw_table(dataset_id, columns, order_col, limit=100):
     return p
 
 
-def _bars(dataset_id, x_axis, grain, metrics, groupby=None, stacked=False):
-    p = _line(dataset_id, x_axis, grain, metrics, "SMART_NUMBER")
+def _bars(dataset_id, x_axis, grain, metrics, groupby=None, stacked=False, where=None):
+    p = _line(dataset_id, x_axis, grain, metrics, "SMART_NUMBER", where)
     p["viz_type"] = "echarts_timeseries_bar"
     if groupby:
         p["groupby"] = groupby
@@ -210,9 +226,9 @@ def main(client, h):
     chart("Failure Rate (Weekly)", rate_id, "echarts_timeseries_line", _line(rate_id, "day", "P1W", [FAILURE_RATE], ".2%"))
     chart("Failure Rate (Monthly)", rate_id, "echarts_timeseries_line", _line(rate_id, "day", "P1M", [FAILURE_RATE], ".2%"))
     chart("Failed vs Total Chart Loads (Daily)", rate_id, "echarts_timeseries_bar",
-          _bars(rate_id, "day", "P1D", [CHART_LOADS, FAILED_LOADS, SERVER_KILLS]))
+          _bars(rate_id, "day", "P1D", [CHART_LOADS, FAILED_LOADS, AUTHZ_DENIED, SERVER_KILLS]))
     chart("Failure Rate by Dashboard", rate_id, "table",
-          _table(rate_id, ["title"], [FAILURE_RATE, CHART_LOADS, FAILED_LOADS, SERVER_ERRORS, SERVER_KILLS], FAILURE_RATE))
+          _table(rate_id, ["title"], [FAILURE_RATE, CHART_LOADS, FAILED_LOADS, AUTHZ_DENIED, SERVER_ERRORS, SERVER_KILLS], FAILURE_RATE))
 
     # speed: successful loads only (a timeout always reads about 15 s and would hide real slowness)
     chart("Chart Load Time (Daily)", loads_id, "echarts_timeseries_line",
@@ -224,10 +240,11 @@ def main(client, h):
 
     # what is failing, whatever the cause: by kind over time, and by message to spot a new cause
     chart("Errors by Category (Weekly)", errors_id, "echarts_timeseries_bar",
-          _bars(errors_id, "event_ts", "P1W", [ERRORS], groupby=["error_category"], stacked=True))
+          _bars(errors_id, "event_ts", "P1W", [ERRORS], groupby=["error_category"], stacked=True,
+                where=DISTINCT_FAILURES))
     chart("Top Error Messages", errors_id, "table",
           _table(errors_id, ["error_category", "error_signature"], [OCCURRENCES, LAST_SEEN, EXAMPLE], OCCURRENCES,
-                 limit=30))
+                 where=DISTINCT_FAILURES, limit=30))
 
     # the individual failures, with their category and raw message (moved here from the usage dashboard)
     chart("Chart Load Errors", errors_id, "table", _raw_table(

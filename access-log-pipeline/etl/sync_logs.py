@@ -31,7 +31,7 @@ import pymysql
 import pymysql.cursors
 
 import iceberg_sink
-from error_classify import classify, one_line, signature
+from error_classify import one_line, row_category_and_signature
 from superset_client import SupersetClient
 
 PAGE_SIZE = int(os.environ.get("ETL_PAGE_SIZE", "100"))
@@ -118,8 +118,8 @@ def extract_browser_error(row):
         "duration_ms": int(duration) if duration is not None else None,
         "chart_id": row.get("slice_id"),
         # cause-agnostic: whatever the browser reported, keep the raw message and derive a category and a signature
-        "error_category": classify(details),
-        "error_signature": signature(details),
+        "error_category": row_category_and_signature("browser", "load_chart_error", None, None, details)[0],
+        "error_signature": row_category_and_signature("browser", "load_chart_error", None, None, details)[1],
         "error_message": details,
     }
 

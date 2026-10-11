@@ -14,11 +14,37 @@ import json
 import sys
 
 import iceberg_sink
-from error_classify import classify, signature
+from error_classify import classify, row_category_and_signature, signature
 from sync_logs import acquire_etl_lock, build_event_rows, mysql_conn
 
 
+def reclassify():
+    """Recompute category and signature for EVERY stored error row with the current rules (error_classify.py), and
+    update the rows that differ. Run this after changing the rules."""
+    if not iceberg_sink.enabled():
+        print("ICEBERG_SINK_ENABLED is off; nothing to do")
+        return 0
+    conn = mysql_conn()
+    if not acquire_etl_lock(conn):
+        print("the ETL holds the single-writer lock; try again when it has finished")
+        return 1
+    sink = iceberg_sink.IcebergSink()
+    cur = sink.conn.cursor()
+    cur.execute("SELECT dedupe_key, event_ts, source, error_type, status_code, request_path, error_message, reason "
+                "FROM fact_error_events")
+    rows = []
+    for dedupe_key, ts, source, error_type, status, path, message, reason in cur.fetchall():
+        category, sig = row_category_and_signature(source, error_type, status, path, message or reason)
+        rows.append({"dedupe_key": dedupe_key, "event_ts": ts, "error_category": category, "error_signature": sig})
+    sent = sink.reclassify(rows)
+    conn.close()
+    print(f"recomputed category and signature for {sent} error rows; rows whose values changed were updated")
+    return 0
+
+
 def main():
+    if "--reclassify" in sys.argv:
+        return reclassify()
     if not iceberg_sink.enabled():
         print("ICEBERG_SINK_ENABLED is off; nothing to do")
         return 0
@@ -48,8 +74,8 @@ def main():
         for r in cur.fetchall():
             row = dict(r)
             # these predate the cause-agnostic columns: derive them from the stored reason
-            row.update(error_category=classify(row["reason"]), error_signature=signature("gunicorn worker timeout"),
-                       error_message=row["reason"])
+            category, sig = row_category_and_signature("gunicorn", "worker_timeout", None, None, row["reason"])
+            row.update(error_category=category, error_signature=sig, error_message=row["reason"])
             sink.add_error(row)
             gunicorn += 1
 
@@ -68,7 +94,8 @@ def main():
     for values in tcur.fetchall():
         row = dict(zip(cols, values))
         text = row["reason"] or ""
-        row.update(error_category=classify(text), error_signature=signature(text), error_message=text)
+        category, sig = row_category_and_signature(row["source"], row["error_type"], None, None, text)
+        row.update(error_category=category, error_signature=sig, error_message=text)
         sink.add_error(row)
         gunicorn += 0  # (counted separately below)
     classified = sink.flush()["errors"] - written["errors"]

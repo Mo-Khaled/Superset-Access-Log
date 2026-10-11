@@ -31,7 +31,7 @@ from datetime import datetime
 from urllib.parse import unquote
 
 import iceberg_sink
-from error_classify import classify, one_line, signature
+from error_classify import classify, one_line, row_category_and_signature
 from sync_logs import acquire_etl_lock, mysql_conn
 
 TS = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
@@ -120,12 +120,15 @@ def parse_lines(lines):
             if exc and not msg:
                 msg = f"{exc[0]}: {exc[1]}"
             dash, chart, path = _url_context(url)
+            category, sig = row_category_and_signature("server", exc[0] if exc else f"http_{status}", status, path, msg)
             yield _row(
                 dedupe_key=f"server:{rid}", event_ts=datetime.strptime(ts, TS_FORMAT), source="server",
                 error_type=exc[0] if exc else f"http_{status}",
                 reason=f"HTTP {status} on {method} {path}: {msg or 'no message'}"[:500],
                 user_id=int(user) if user.isdigit() else None, dashboard_id=dash, chart_id=chart,
-                duration_ms=int(dur), error_category=classify(msg, status), error_signature=signature(msg or f"http {status}"),
+                duration_ms=int(dur), error_category=category,
+                # the endpoint and status are part of what makes this error this error; the record id is not
+                error_signature=sig,
                 error_message=msg or f"HTTP {status}", status_code=status, request_path=path, request_id=rid,
                 _matched=True,
             )
@@ -142,8 +145,10 @@ def parse_lines(lines):
             ctx.pop("_desc", None)
             yield _row(
                 dedupe_key=f"gunicorn:{ts}:{pid}", event_ts=datetime.strptime(ts, TS_FORMAT), source="gunicorn",
-                error_type="worker_timeout", reason=reason[:500], error_category=classify(msg),
-                error_signature=signature("gunicorn worker timeout"), error_message=msg, **ctx,
+                error_type="worker_timeout", reason=reason[:500],
+                error_category=row_category_and_signature("gunicorn", "worker_timeout", None, None, msg)[0],
+                error_signature=row_category_and_signature("gunicorn", "worker_timeout", None, None, msg)[1],
+                error_message=msg, **ctx,
             )
             continue
 
@@ -160,7 +165,8 @@ def parse_lines(lines):
             yield _row(
                 dedupe_key=f"gunicorn_kill:{ts}:{pid}", event_ts=datetime.strptime(ts, TS_FORMAT), source="gunicorn",
                 error_type="worker_killed", reason=reason[:500], error_category="worker_failure",
-                error_signature=signature(f"gunicorn worker was sent {sig}"), error_message=msg, **ctx,
+                error_signature=row_category_and_signature("gunicorn", "worker_killed", None, None, msg)[1],
+                error_message=msg, **ctx,
             )
             continue
 
@@ -182,7 +188,7 @@ def parse_lines(lines):
             yield _row(
                 dedupe_key=f"gunicorn_err:{ts}:{_short(msg)}", event_ts=datetime.strptime(ts, TS_FORMAT),
                 source="gunicorn", error_type="gunicorn_error", reason=f"gunicorn {level}: {msg}"[:500],
-                error_category=classify(msg), error_signature=signature(msg), error_message=msg,
+                error_category=classify(msg), error_signature="gunicorn " + signature(msg), error_message=msg,
             )
 
 

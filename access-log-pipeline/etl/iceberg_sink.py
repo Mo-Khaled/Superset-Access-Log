@@ -131,6 +131,22 @@ def merge_error_sql(rows):
     )
 
 
+RECLASSIFY_SPEC = [("dedupe_key", "varchar"), ("event_ts", "timestamp(6)"),
+                    ("error_category", "varchar"), ("error_signature", "varchar")]
+
+
+def merge_reclassify_sql(rows):
+    """Rewrites error_category and error_signature on existing rows whose value differs (used after the classification
+    rules change). Rows that already carry the right values are not touched."""
+    return (
+        "MERGE INTO fact_error_events t USING (%s) s\n"
+        "ON t.dedupe_key = s.dedupe_key AND t.event_ts = s.event_ts\n"
+        "WHEN MATCHED AND (t.error_category IS DISTINCT FROM s.error_category\n"
+        "              OR t.error_signature IS DISTINCT FROM s.error_signature) THEN UPDATE SET\n"
+        "    error_category = s.error_category, error_signature = s.error_signature" % _typed_source(rows, RECLASSIFY_SPEC)
+    )
+
+
 def merge_dashboards_sql(rows):
     return (
         "MERGE INTO dim_dashboards t USING (%s) s\n"
@@ -173,6 +189,15 @@ class IcebergSink:
             run_sql(self.conn, merge_error_sql(list(self.errors.values())))
             self.written["errors"] += len(self.errors)
             self.errors = {}
+
+    def reclassify(self, rows):
+        """Apply new category/signature values to existing error rows, in batches. Returns rows sent."""
+        sent = 0
+        for i in range(0, len(rows), BATCH_ROWS):
+            chunk = rows[i:i + BATCH_ROWS]
+            run_sql(self.conn, merge_reclassify_sql(chunk))
+            sent += len(chunk)
+        return sent
 
     def flush(self):
         self._flush_access()

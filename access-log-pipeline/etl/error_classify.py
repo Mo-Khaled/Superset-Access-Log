@@ -53,25 +53,79 @@ def classify(message, status=None):
     return "unclassified"
 
 
-_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"|`[^`]*`")
-_BRACKETS = re.compile(r"\[[^\]]*\]|\{[^}]*\}|\([^)]*\)")
-_HEX_ID = re.compile(r"\b[0-9a-f]{8,}\b", re.I)
-_NUMBER = re.compile(r"\d+(\.\d+)?")
+# ---- signature: remove only what is specific to ONE occurrence, keep what is informative ----
+#
+# Removed:  numbers, UUIDs and long hex ids, timestamps/dates, IP addresses, quoted VALUES (text with digits, spaces
+#           or more than 30 characters, such as literals in "invalid input syntax for integer: 'abc 123'"), and
+#           very long bracketed lists.
+# Kept:     HTTP status codes ("http 422" and "http 500" stay different), identifier names in quotes or short lists
+#           ("column "foo" does not exist", "columns missing in dataset: ['title', 'owner']"), exception class names,
+#           words. Two different missing columns are two different problems, so they stay two signatures.
+# The cost: a message built around many different identifiers produces many signatures. That is visible in the Top
+# Error Messages table, and the raw message is always kept, so nothing is lost by erring on the side of keeping.
+_UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+_TIMESTAMP = re.compile(r"\b\d{4}-\d{2}-\d{2}([t ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(z|[+-]\d{2}:?\d{2})?\b", re.I)
+_IPV4 = re.compile(r"\b\d{1,3}(\.\d{1,3}){3}(:\d+)?\b")
+_HEX_ID = re.compile(r"\b(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{8,}\b", re.I)  # hex run that mixes digits and letters
+_QUOTED = re.compile(r"'([^']*)'|\"([^\"]*)\"|`([^`]*)`")
+_GROUPED = re.compile(r"\[[^\]]{60,}\]|\{[^}]{60,}\}|\([^)]{60,}\)")
+_NUMBER = re.compile(r"\b\d+(\.\d+)?\b")
 _SPACE = re.compile(r"\s+")
+_STATUS_CONTEXT = re.compile(r"(http|https|status|code|error|errno)[ :=#]*$")
 
 
-def signature(message, limit=100):
-    """The message with the variable parts removed, so errors that differ only in an id, a number or a quoted value group
-    together. 'Columns missing in dataset: [title, owner]' and the same with other names give one signature."""
+def _quoted(m):
+    value = m.group(1) if m.group(1) is not None else (m.group(2) if m.group(2) is not None else m.group(3))
+    quote = m.group(0)[0]
+    looks_like_identifier = re.fullmatch(r"[\w.\-]{1,30}", value or "") and not re.search(r"\d", value or "")
+    return m.group(0) if looks_like_identifier else f"{quote}?{quote}"
+
+
+def _number(m, text):
+    value = m.group(0)
+    if len(value) == 3 and value[0] in "1345" and _STATUS_CONTEXT.search(text[max(0, m.start() - 14):m.start()]):
+        return value  # an HTTP status code is information, not noise
+    return "N"
+
+
+def signature(message, limit=120):
+    """The message with the parts specific to one occurrence removed, so the same error groups together while different
+    errors stay apart. See the notes above for exactly what is removed and what is kept."""
     s = (message or "").strip().lower()
-    s = _QUOTED.sub("?", s)
-    s = _BRACKETS.sub("[..]", s)
+    s = _UUID.sub("<uuid>", s)
+    s = _TIMESTAMP.sub("<ts>", s)
+    s = _IPV4.sub("<ip>", s)
     s = _HEX_ID.sub("<id>", s)
-    s = _NUMBER.sub("N", s)
+    s = _QUOTED.sub(_quoted, s)
+    s = _GROUPED.sub("[..]", s)
+    s = _NUMBER.sub(lambda m: _number(m, s), s)
     s = _SPACE.sub(" ", s).strip(" :;,.")
     return s[:limit] or "(no message)"
+
+
+_PATH_ID = re.compile(r"/(\d+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=/|$)", re.I)
+
+
+def path_template(path):
+    """'/api/v1/chart/166/data' -> '/api/v1/chart/{id}/data': the endpoint, without which record it was about."""
+    return _PATH_ID.sub("/{id}", path or "")
 
 
 def one_line(text, limit=300):
     """Messages are stored as a single trimmed line."""
     return _SPACE.sub(" ", str(text or "")).strip()[:limit]
+
+
+def row_category_and_signature(source, error_type, status_code, request_path, message):
+    """Category and signature of an error row, from the fields that are STORED on it. Every writer (ETL, ingest, backfill,
+    reclassify) uses this one function, so a row gets the same answer wherever it is computed and a change to the rules can
+    be applied to old rows by recomputing from the table."""
+    message = message or ""
+    if source == "gunicorn":
+        # one signature per kind of incident, whatever pid or request it involved
+        category = "worker_failure" if error_type == "worker_killed" else classify(message)
+        return category, "gunicorn " + (error_type or "error").replace("_", " ")
+    if source == "server":
+        category = classify(message, status_code)
+        return category, signature(f"http {status_code} {path_template(request_path)}: {message or 'no message'}")
+    return classify(message, status_code), signature(message)
