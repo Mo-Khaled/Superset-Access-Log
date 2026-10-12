@@ -1,6 +1,6 @@
 """
-Incremental ETL: Superset's log (/api/v1/log/) -> Iceberg, through Trino: raw_log_landing, dim_users, dim_dashboards,
-fact_access_events and fact_error_events. Iceberg is the only store (there is no MySQL).
+Incremental ETL: Superset's log (/api/v1/log/) -> Iceberg, through Trino: raw_log_landing, dim_entities,
+fact_access_events and fact_error_events. Iceberg is the only store.
 
 Run standalone: `python etl/sync_logs.py [--since TIMESTAMP | --full | --reprocess]` (PYTHONPATH must include the
 pipeline root -- see the Dockerfile / README).
@@ -244,7 +244,7 @@ def _dashboard_row(d):
 
 
 def sync_all_dashboards(client: SupersetClient, sink):
-    """Sends every dashboard Superset currently knows about to dim_dashboards -- not just ones referenced by a log
+    """Sends every dashboard Superset currently knows about to dim_entities -- not just ones referenced by a log
     row. A dashboard with zero views never appears in a log pull at all, so without this pass it could never show up
     in the "zero/near-zero views" report, which defeats the point of that report (the whole reason to run it is to
     find dashboards nobody's touching)."""
@@ -262,7 +262,7 @@ def sync_all_dashboards(client: SupersetClient, sink):
 
 
 def sync_all_charts(client: SupersetClient, sink):
-    """Sends every chart's name to dim_charts, so usage reports can show chart names instead of ids."""
+    """Sends every chart's name to dim_entities, so usage reports can show chart names instead of ids."""
     page = 0
     while True:
         resp = client.get(f"/api/v1/chart/?q=(page:{page},page_size:100)")
@@ -290,17 +290,12 @@ def enrich_dashboard(client: SupersetClient, cache: dict, sink, dashboard_id):
     sink.add_dashboard(_dashboard_row(d))
 
 
-def enrich_user(client: SupersetClient, cache: dict, sink, user_id, username_hint):
+def enrich_user(cache: dict, sink, user_id, username_hint):
+    """Superset puts the username in every log row, so the user dimension needs no API call."""
     if user_id is None or user_id in cache:
         return
     cache[user_id] = True
-    try:
-        u = client.get(f"/api/v1/user/{user_id}").json().get("result", {})
-    except Exception:  # noqa: BLE001
-        u = {}
-    sink.add_user({"user_id": user_id, "username": u.get("username", username_hint or f"user_{user_id}"),
-                   "first_name": u.get("first_name"), "last_name": u.get("last_name"), "email": u.get("email"),
-                   "is_active": bool(u.get("active", True))})
+    sink.add_user({"user_id": user_id, "username": username_hint or f"user_{user_id}"})
 
 
 def pull(client, sink, since_ts, known_ids, stats, dashboard_cache, user_cache):
@@ -320,7 +315,7 @@ def pull(client, sink, since_ts, known_ids, stats, dashboard_cache, user_cache):
 
             user_id = row.get("user_id")
             username_hint = (row.get("user") or {}).get("username") if isinstance(row.get("user"), dict) else None
-            enrich_user(client, user_cache, sink, user_id, username_hint)
+            enrich_user(user_cache, sink, user_id, username_hint)
             enrich_dashboard(client, dashboard_cache, sink, row.get("dashboard_id"))
 
             access, error = build_event_rows(row)
@@ -402,7 +397,7 @@ def _run_locked(client, conn, lease, stats, since, full, reprocess):
           f"({stats['raw_new']} new, {already} already stored), "
           f"{stats['fact']} access events, {stats['errors']} browser errors; pull started at {start:%Y-%m-%d %H:%M:%S}")
     print(f"iceberg: sent {written['access']} access rows, {written['errors']} error rows, {written['raw']} raw rows, "
-          f"{written['dashboards']} dashboards, {written['charts']} charts, {written['users']} users to MERGE (rows already present are left untouched)")
+          f"{written['entities']} dashboards/charts/users to MERGE (rows already present are left untouched)")
     return 0
 
 

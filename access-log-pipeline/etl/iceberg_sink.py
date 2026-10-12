@@ -114,11 +114,14 @@ ERROR_SPEC = [
     ("error_category", "varchar"), ("error_signature", "varchar"), ("error_message", "varchar"),
     ("status_code", "integer"), ("request_path", "varchar"), ("request_id", "varchar"),
 ]
-DASH_SPEC = [("dashboard_id", "integer"), ("title", "varchar"), ("owner_names", "varchar"),
-             ("created_on", "timestamp(6)"), ("changed_on", "timestamp(6)")]
-CHART_SPEC = [("chart_id", "integer"), ("name", "varchar"), ("changed_on", "timestamp(6)")]
-USER_SPEC = [("user_id", "integer"), ("username", "varchar"), ("first_name", "varchar"), ("last_name", "varchar"),
-             ("email", "varchar"), ("is_active", "boolean")]
+ENTITY_SPEC = [("entity_type", "varchar"), ("entity_id", "integer"), ("name", "varchar"), ("owner_names", "varchar"),
+               ("created_on", "timestamp(6)"), ("changed_on", "timestamp(6)")]
+LOG_SPEC = [("line_id", "varchar"), ("event_ts", "timestamp(6)"), ("service", "varchar"), ("level", "varchar"),
+            ("kind", "varchar"), ("pid", "integer"), ("request_id", "varchar"), ("user_id", "integer"),
+            ("dashboard_id", "integer"), ("chart_id", "integer"), ("method", "varchar"), ("url_path", "varchar"),
+            ("status_code", "integer"), ("duration_ms", "integer"), ("is_error", "boolean"), ("message", "varchar")]
+LOG_EXTRACT_COLS = ["level", "kind", "pid", "request_id", "user_id", "dashboard_id", "chart_id", "method", "url_path",
+                    "status_code", "duration_ms", "is_error"]
 RAW_SPEC = [("source_log_id", "bigint"), ("source_dttm", "timestamp(6)"), ("payload", "varchar")]
 
 
@@ -177,37 +180,35 @@ def merge_reclassify_sql(rows):
     )
 
 
-def merge_dashboards_sql(rows):
+def merge_entities_sql(rows):
     return (
-        "MERGE INTO dim_dashboards t USING (%s) s\n"
-        "ON t.dashboard_id = s.dashboard_id\n"
-        "WHEN MATCHED AND (t.title IS DISTINCT FROM s.title OR t.owner_names IS DISTINCT FROM s.owner_names\n"
+        "MERGE INTO dim_entities t USING (%s) s\n"
+        "ON t.entity_type = s.entity_type AND t.entity_id = s.entity_id\n"
+        "WHEN MATCHED AND (t.name IS DISTINCT FROM s.name OR t.owner_names IS DISTINCT FROM s.owner_names\n"
         "              OR t.changed_on IS DISTINCT FROM s.changed_on) THEN UPDATE SET\n"
-        "    title = s.title, owner_names = s.owner_names, created_on = s.created_on, changed_on = s.changed_on\n"
-        "WHEN NOT MATCHED THEN INSERT %s" % (_typed_source(rows, DASH_SPEC), _insert_cols(DASH_SPEC))
+        "    name = s.name, owner_names = s.owner_names, created_on = s.created_on, changed_on = s.changed_on\n"
+        "WHEN NOT MATCHED THEN INSERT %s" % (_typed_source(rows, ENTITY_SPEC), _insert_cols(ENTITY_SPEC))
     )
 
 
-def merge_charts_sql(rows):
+def merge_log_lines_sql(rows):
+    cols = [c for c, _ in LOG_SPEC]
     return (
-        "MERGE INTO dim_charts t USING (%s) s\n"
-        "ON t.chart_id = s.chart_id\n"
-        "WHEN MATCHED AND (t.name IS DISTINCT FROM s.name OR t.changed_on IS DISTINCT FROM s.changed_on) THEN UPDATE SET\n"
-        "    name = s.name, changed_on = s.changed_on\n"
-        "WHEN NOT MATCHED THEN INSERT %s" % (_typed_source(rows, CHART_SPEC), _insert_cols(CHART_SPEC))
+        "MERGE INTO container_log_lines t USING (%s) s\n"
+        "ON t.line_id = s.line_id AND t.event_ts = s.event_ts\n"
+        "WHEN NOT MATCHED THEN INSERT (%s, ingested_at) VALUES (%s, CAST(current_timestamp AT TIME ZONE 'UTC' AS timestamp(6)))"
+        % (_typed_source(rows, LOG_SPEC), ", ".join(cols), ", ".join("s." + c for c in cols))
     )
 
 
-def merge_users_sql(rows):
+def merge_log_extract_sql(rows):
+    """Rewrites the parsed columns of existing container_log_lines rows (used by the backfill after the parsing changes)."""
+    diff = " OR ".join("t.%s IS DISTINCT FROM s.%s" % (c, c) for c in LOG_EXTRACT_COLS)
+    sets = ", ".join("%s = s.%s" % (c, c) for c in LOG_EXTRACT_COLS)
     return (
-        "MERGE INTO dim_users t USING (%s) s\n"
-        "ON t.user_id = s.user_id\n"
-        "WHEN MATCHED AND (t.username IS DISTINCT FROM s.username OR t.first_name IS DISTINCT FROM s.first_name\n"
-        "              OR t.last_name IS DISTINCT FROM s.last_name OR t.email IS DISTINCT FROM s.email\n"
-        "              OR t.is_active IS DISTINCT FROM s.is_active) THEN UPDATE SET\n"
-        "    username = s.username, first_name = s.first_name, last_name = s.last_name, email = s.email,\n"
-        "    is_active = s.is_active\n"
-        "WHEN NOT MATCHED THEN INSERT %s" % (_typed_source(rows, USER_SPEC), _insert_cols(USER_SPEC))
+        "MERGE INTO container_log_lines t USING (%s) s\n"
+        "ON t.line_id = s.line_id AND t.event_ts = s.event_ts\n"
+        "WHEN MATCHED AND (%s) THEN UPDATE SET %s" % (_typed_source(rows, LOG_SPEC), diff, sets)
     )
 
 
@@ -231,10 +232,10 @@ class IcebergSink:
     def __init__(self, conn=None, on_progress=None):
         self.conn = conn or trino_conn()
         self.on_progress = on_progress  # called after every statement, e.g. to renew the single-writer lease
-        self.access, self.errors, self.dashboards, self.users, self.raw = {}, {}, {}, {}, {}
-        self.charts = {}
+        self.access, self.errors, self.entities, self.raw = {}, {}, {}, {}
+        self.log_lines, self.log_chars = {}, 0
         self.raw_chars = 0
-        self.written = {"access": 0, "errors": 0, "dashboards": 0, "charts": 0, "users": 0, "raw": 0}
+        self.written = {"access": 0, "errors": 0, "entities": 0, "raw": 0, "log_lines": 0}
 
     def _run(self, sql):
         run_sql(self.conn, sql)
@@ -252,14 +253,32 @@ class IcebergSink:
         if len(self.errors) >= BATCH_ROWS:
             self._flush_errors()
 
+    def add_entity(self, entity_type, entity_id, name, owner_names=None, created_on=None, changed_on=None):
+        self.entities[(entity_type, entity_id)] = {
+            "entity_type": entity_type, "entity_id": entity_id, "name": name, "owner_names": owner_names,
+            "created_on": created_on, "changed_on": changed_on}
+
     def add_dashboard(self, row):
-        self.dashboards[row["dashboard_id"]] = row
+        self.add_entity("dashboard", row["dashboard_id"], row["title"], row.get("owner_names"), row.get("created_on"),
+                        row.get("changed_on"))
 
     def add_chart(self, row):
-        self.charts[row["chart_id"]] = row
+        self.add_entity("chart", row["chart_id"], row["name"], changed_on=row.get("changed_on"))
 
     def add_user(self, row):
-        self.users[row["user_id"]] = row
+        self.add_entity("user", row["user_id"], row["username"])
+
+    def add_log_line(self, row):
+        self.log_lines[row["line_id"]] = row
+        self.log_chars += len(row["message"])
+        if len(self.log_lines) >= RAW_BATCH_ROWS or self.log_chars >= RAW_BATCH_CHARS:
+            self._flush_log_lines()
+
+    def _flush_log_lines(self):
+        if self.log_lines:
+            self._run(merge_log_lines_sql(list(self.log_lines.values())))
+            self.written["log_lines"] += len(self.log_lines)
+            self.log_lines, self.log_chars = {}, 0
 
     def add_raw(self, row):
         self.raw[row["source_log_id"]] = row
@@ -280,18 +299,10 @@ class IcebergSink:
             self.errors = {}
 
     def _flush_dims(self):
-        if self.dashboards:
-            self._run(merge_dashboards_sql(list(self.dashboards.values())))
-            self.written["dashboards"] += len(self.dashboards)
-            self.dashboards = {}
-        if self.charts:
-            self._run(merge_charts_sql(list(self.charts.values())))
-            self.written["charts"] += len(self.charts)
-            self.charts = {}
-        if self.users:
-            self._run(merge_users_sql(list(self.users.values())))
-            self.written["users"] += len(self.users)
-            self.users = {}
+        if self.entities:
+            self._run(merge_entities_sql(list(self.entities.values())))
+            self.written["entities"] += len(self.entities)
+            self.entities = {}
 
     def _flush_raw(self):
         if self.raw:
@@ -302,6 +313,15 @@ class IcebergSink:
             self._run(merge_raw_sql(list(self.raw.values())))
             self.written["raw"] += len(self.raw)
             self.raw, self.raw_chars = {}, 0
+
+    def update_log_columns(self, rows):
+        """Rewrite the parsed columns on existing container_log_lines rows, in batches. Returns rows sent."""
+        sent = 0
+        for i in range(0, len(rows), RAW_BATCH_ROWS):
+            chunk = rows[i:i + RAW_BATCH_ROWS]
+            self._run(merge_log_extract_sql(chunk))
+            sent += len(chunk)
+        return sent
 
     def reclassify(self, rows):
         """Apply new category/signature values to existing error rows, in batches. Returns rows sent."""
@@ -317,4 +337,5 @@ class IcebergSink:
         self._flush_errors()
         self._flush_dims()
         self._flush_raw()
+        self._flush_log_lines()
         return dict(self.written)

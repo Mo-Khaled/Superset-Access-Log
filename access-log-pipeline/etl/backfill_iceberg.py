@@ -7,6 +7,10 @@ Rebuilds Iceberg facts from what Iceberg already holds. Use it after changing ho
   python etl/backfill_iceberg.py --reclassify recompute category and signature for EVERY stored error row with the
                                               current rules, and update the rows whose values differ
 
+  python etl/backfill_iceberg.py --log-lines  re-parse every stored container log line with the current rules: fills the parsed
+                                              columns (user, chart, status, is_error, ...), links gunicorn timeouts to their
+                                              request, and deletes the noise lines (LOG_DROP_PATHS)
+
 Idempotent (MERGE), so it is safe to run more than once. Takes the same single-writer lease as the ETL.
 Server-side rows (gunicorn, server, celery) cannot be rebuilt from raw_log_landing, so only --reclassify touches them.
 """
@@ -16,6 +20,7 @@ import sys
 import iceberg_sink
 import iceberg_state
 from error_classify import row_category_and_signature
+from ingest_container_errors import build_log_rows
 from sync_logs import LOCK_NAME, build_event_rows
 
 
@@ -32,6 +37,26 @@ def reclassify(conn, sink):
         rows.append({"dedupe_key": dedupe_key, "event_ts": ts, "error_category": category, "error_signature": sig})
     sent = sink.reclassify(rows)
     print(f"recomputed category and signature for {sent} error rows; rows whose values changed were updated")
+    return 0
+
+
+def rebuild_log_lines(conn, sink):
+    """Re-parses every stored container log line: fills the parsed columns, resolves gunicorn timeouts to their request,
+    and deletes lines that are now considered noise."""
+    stored = iceberg_sink.run_sql(conn, "SELECT line_id, event_ts, service, message FROM container_log_lines")
+    ids = {(svc, ts, msg): line_id for line_id, ts, svc, msg in stored}
+    rows = build_log_rows([(svc, ts, msg) for _id, ts, svc, msg in stored])
+    kept = set()
+    for r in rows:
+        r["line_id"] = ids.get((r["service"], r["event_ts"], r["message"]), r["line_id"])  # keep the stored id
+        kept.add(r["line_id"])
+    sent = sink.update_log_columns(rows)
+    drop = [(line_id, ts) for line_id, ts, _svc, _msg in stored if line_id not in kept]
+    for i in range(0, len(drop), 500):
+        chunk = drop[i:i + 500]
+        iceberg_sink.run_sql(conn, "DELETE FROM container_log_lines WHERE line_id IN (%s)"
+                             % ", ".join("'%s'" % line_id for line_id, _ts in chunk))
+    print(f"re-parsed {sent} container log lines (rows whose values changed were updated); deleted {len(drop)} noise lines")
     return 0
 
 
@@ -66,7 +91,11 @@ def main():
         return 1
     try:
         sink = iceberg_sink.IcebergSink(on_progress=lease.renew)
-        return reclassify(conn, sink) if "--reclassify" in sys.argv else replay(conn, sink)
+        if "--reclassify" in sys.argv:
+            return reclassify(conn, sink)
+        if "--log-lines" in sys.argv:
+            return rebuild_log_lines(conn, sink)
+        return replay(conn, sink)
     finally:
         lease.release()
 

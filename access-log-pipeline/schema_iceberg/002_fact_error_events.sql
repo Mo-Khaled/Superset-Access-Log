@@ -1,4 +1,4 @@
--- Failures observed around chart loads, with the reason. Replaces MySQL fact_error_events.
+-- Failures observed around chart loads, with the reason.
 --   source = 'browser'  : a load_chart row in Superset's logs table with has_err = true
 --   source = 'gunicorn' : a gunicorn arbiter problem (worker timeout, killed worker, ...), joined to its request via the worker pid
 --   source = 'server'   : a dashboard/chart request that ended with HTTP >= 400 (status, message, exception class)

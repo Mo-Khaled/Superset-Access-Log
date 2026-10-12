@@ -14,10 +14,15 @@ etl/error_classify.py):
            last REQTRACE line that worker wrote
   celery   a failed background task ("raised unexpected")
 
+Every line is also stored in container_log_lines (service, docker timestamp, level, kind, pid, request id, user, dashboard,
+chart, method, path, status, duration, an is_error flag, text), so the
+raw logs can be queried in Trino. That needs the service name and docker's timestamps, so pipe the logs in WITH the
+prefix and `--timestamps` (run_etl.sh does). A line with no timestamp cannot be keyed and is skipped.
+
 Anything that is not recognised is still stored (category `unclassified`) when it is an error line; nothing is dropped.
 
 The pipeline container has no docker access, so pipe the logs in from the host (superset-worker is optional):
-    docker compose logs --no-log-prefix --since 1h superset superset-worker \\
+    docker compose logs --timestamps --since 1h superset superset-worker \\
         | docker compose exec -T pipeline python etl/ingest_container_errors.py
 
 Idempotent: every row has a stable dedupe_key; re-running fills in missing context but never duplicates.
@@ -49,6 +54,110 @@ TIMEOUT_S = os.environ.get("SUPERSET_WEBSERVER_TIMEOUT", "?")
 TRACE_MAX_AGE_S = 120  # a request killed by the timeout started at most this long ago
 KILL_FOLLOWS_TIMEOUT_S = 10  # gunicorn sends SIGKILL right after a timeout; that is one incident, not two
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+PREFIX = re.compile(r"^(?:(?P<svc>\S+?)-\d+\s+\|\s?)?(?:(?P<ts>\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s)?(?P<msg>.*)$")
+LEVEL = re.compile(r"\[(CRITICAL|ERROR|WARNING|INFO|DEBUG)\]|: (CRITICAL|ERROR|WARNING|INFO|DEBUG)/|^(CRITICAL|ERROR|WARNING|INFO|DEBUG)\b")
+ACCESS = re.compile(r'^\S+ - \S* \[[^\]]+\] "(?P<method>[A-Z]+) (?P<url>\S+) [^"]*" (?P<status>\d{3}) ')
+# Request paths whose lines are not stored in container_log_lines: the ETL's own polling of Superset's log API plus health
+# checks are about 30% of the lines and never matter when tracing an error. Comma separated path prefixes.
+DROP_PATHS = [p.strip() for p in os.environ.get("LOG_DROP_PATHS", "/health,/api/v1/log/").split(",") if p.strip()]
+MAX_MESSAGE = 4000
+
+
+def split_line(raw):
+    """(service, docker timestamp as a naive UTC datetime or None, message) from one `docker compose logs --timestamps`
+    line. The service prefix and the timestamp are both optional."""
+    m = PREFIX.match(raw.rstrip("\n"))
+    ts = None
+    if m.group("ts"):
+        base, _, frac = m.group("ts").rstrip("Z").partition(".")
+        ts = datetime.strptime(base, "%Y-%m-%dT%H:%M:%S").replace(microsecond=int((frac + "000000")[:6] or 0))
+    return m.group("svc") or "unknown", ts, m.group("msg")
+
+
+def _int_or_none(text):
+    return int(text) if text and text.isdigit() else None
+
+
+def extract_fields(msg):
+    """kind, level and the fields worth filtering on, from one log message (all None / False when a line has none).
+    kind is what produced the line: reqtrace | reqend | reqexc (added by superset_config.py), gunicorn, celery, access
+    (HTTP access line) or app (anything else)."""
+    f = {"kind": "app", "level": None, "pid": None, "request_id": None, "user_id": None, "dashboard_id": None,
+         "chart_id": None, "method": None, "url_path": None, "status_code": None, "duration_ms": None, "is_error": False}
+    m = REQEND.search(msg)
+    if m:
+        _ts, pid, user, method, rid, status, dur, url, _msg = m.groups()
+        dash, chart, path = _url_context(url)
+        f.update(kind="reqend", pid=int(pid), request_id=rid, user_id=_int_or_none(user), dashboard_id=dash,
+                 chart_id=chart, method=method, url_path=path, status_code=int(status), duration_ms=int(dur), is_error=True)
+        return f
+    m = TRACE.search(msg)
+    if m:
+        _ts, pid, user, method, rid, url = m.groups()
+        dash, chart, path = _url_context(url)
+        f.update(kind="reqtrace", pid=int(pid), request_id=rid, user_id=_int_or_none(user), dashboard_id=dash,
+                 chart_id=chart, method=method, url_path=path)
+        return f
+    m = REQEXC.search(msg)
+    if m:
+        _ts, pid, rid, _exc, _msg = m.groups()
+        f.update(kind="reqexc", pid=int(pid), request_id=rid, is_error=True)
+        return f
+    m = ACCESS.match(msg)
+    if m:
+        status = int(m.group("status"))
+        # only 5xx counts as an error here: a 4xx on a dashboard/chart path already has a (richer) reqend line, and the other
+        # 4xx are client noise; 5xx on any other path would otherwise be invisible
+        f.update(kind="access", method=m.group("method"), url_path=m.group("url").split("?")[0], status_code=status,
+                 is_error=status >= 500)
+        return f
+    if re.search(r"\[\d{4}-\d{2}-\d{2} [\d:]+ [+-]\d{4}\] \[\d+\] \[", msg):
+        f["kind"] = "gunicorn"
+    elif re.search(r"\[\d{4}-\d{2}-\d{2} [\d:,]+: \w+/", msg):
+        f["kind"] = "celery"
+    lv = LEVEL.search(msg)
+    f["level"] = next((g for g in lv.groups() if g), None) if lv else None
+    f["is_error"] = f["level"] in ("ERROR", "CRITICAL")
+    pid = re.search(r"pid[=:](\d+)", msg)
+    f["pid"] = int(pid.group(1)) if pid else None
+    return f
+
+
+def log_line_row(service, ts, msg):
+    f = extract_fields(msg)
+    f.update(
+        line_id=hashlib.sha1(f"{service}|{ts.isoformat()}|{msg}".encode("utf-8", "replace")).hexdigest(),
+        event_ts=ts, service=service, message=msg[:MAX_MESSAGE],
+    )
+    return f
+
+
+def _dropped(row):
+    return row["kind"] in ("access", "reqtrace") and any((row["url_path"] or "").startswith(p) for p in DROP_PATHS)
+
+
+def build_log_rows(lines):
+    """container_log_lines rows from (service, timestamp, message) tuples: drops the noise (LOG_DROP_PATHS) and ties each
+    gunicorn timeout / killed worker to the request its worker pid was serving (the pid's last REQTRACE, at most
+    TRACE_MAX_AGE_S earlier), so the request id, user, dashboard and chart are columns too. Lines without a timestamp
+    cannot be keyed and are left out."""
+    rows = [log_line_row(svc, ts, msg) for svc, ts, msg in lines if ts is not None]
+    rows = [r for r in rows if not _dropped(r)]
+    rows.sort(key=lambda r: (r["service"], r["event_ts"]))
+    last_trace = {}
+    for r in rows:
+        key = (r["service"], r["pid"])
+        if r["kind"] == "reqtrace":
+            last_trace[key] = r
+        elif r["kind"] == "gunicorn" and ("WORKER TIMEOUT" in r["message"] or "was sent SIG" in r["message"]):
+            r["is_error"] = True
+            t = last_trace.get(key)
+            if t is not None and 0 <= (r["event_ts"] - t["event_ts"]).total_seconds() <= TRACE_MAX_AGE_S:
+                for col in ("request_id", "user_id", "dashboard_id", "chart_id", "method", "url_path"):
+                    r[col] = t[col]
+    return rows
 
 
 def _first_int(pattern, text):
@@ -197,7 +306,11 @@ def parse_lines(lines):
 def main():
     conn = iceberg_sink.trino_conn()
     lease = iceberg_state.Lease(conn, LOCK_NAME)
-    rows = list(parse_lines(sys.stdin))  # parse before taking the lease: it needs no Trino
+    parsed = [split_line(raw) for raw in sys.stdin if raw.strip()]  # parse before taking the lease: it needs no Trino
+    rows = list(parse_lines([msg for _svc, _ts, msg in parsed]))
+    log_rows = build_log_rows(parsed)
+    skipped = sum(1 for _svc, ts, _msg in parsed if ts is None)
+    dropped = len(parsed) - skipped - len(log_rows)
     if not lease.acquire():
         print("the ETL (or another ingest) holds the single-writer lease; skipping this run")
         return 0
@@ -208,10 +321,15 @@ def main():
         sink = iceberg_sink.IcebergSink(conn, on_progress=lease.renew)
         for r in rows:
             sink.add_error({k: v for k, v in r.items() if k != "_matched"})
-        written = sink.flush()["errors"]
+        for r in log_rows:
+            sink.add_log_line(r)
+        flushed = sink.flush()
+        written = flushed["errors"]
         detail = ", ".join(f"{k}={v}" for k, v in sorted(by_source.items())) or "none"
         iceberg_state.record_run(conn, "ingest", "ok", len(rows), written, detail)
         print(f"server-side errors found: {len(rows)} ({detail}); sent to iceberg: {written}")
+        print(f"container log lines: {len(log_rows)} sent to iceberg ({dropped} noise lines dropped)"
+              + (f", {skipped} skipped (no docker timestamp: use `docker compose logs --timestamps`)" if skipped else ""))
         return 0
     except Exception as exc:  # noqa: BLE001
         iceberg_state.record_run(conn, "ingest", "failed", len(rows), 0, str(exc))

@@ -8,7 +8,7 @@ fires `dashboard_load` / `chart_data` log events, via calls the frontend batches
 `/api/v1/log/`). That's out of scope for a backend lab whose goal is realistic *log
 data*, not re-rendering charts. Instead we:
   1. Create real Superset user accounts directly in the metadata DB (see
-     pbkdf2_password_hash below), so /api/v1/user/ + dim_users resolve real names.
+     pbkdf2_password_hash below), so the log rows (and the user dimension built from them) carry real names.
   2. Read real dashboards/charts already created by `superset load_examples`.
   3. Insert log rows directly into Superset's `logs` table, shaped exactly like the
      rows Superset itself would write (same columns, same action names), with a

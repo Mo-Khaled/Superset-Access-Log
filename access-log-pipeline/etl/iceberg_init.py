@@ -19,7 +19,7 @@ from iceberg_sink import CATALOG, SCHEMA, run_sql, trino_conn
 # without access is expected behaviour, not a reliability problem. They are still reported as `authorization_denied`.
 AUTHZ_COUNTS_AS_FAILURE = os.environ.get("AUTHZ_COUNTS_AS_FAILURE", "false").strip().lower() in ("1", "true", "yes", "on")
 SQL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "schema_iceberg")
-TABLES = ["fact_access_events", "fact_error_events", "dim_dashboards", "dim_charts", "dim_users", "raw_log_landing", "etl_run_log", "etl_lock"]
+TABLES = ["fact_access_events", "fact_error_events", "dim_entities", "raw_log_landing", "container_log_lines", "etl_run_log", "etl_lock"]
 
 
 def _statements(path):

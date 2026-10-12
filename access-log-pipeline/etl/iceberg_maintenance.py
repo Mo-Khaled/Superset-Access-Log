@@ -6,7 +6,8 @@ For each table:
   optimize            merges small data files into larger ones (and applies row-level deletes)
   expire_snapshots    drops snapshots older than ICEBERG_RETENTION (time travel beyond that is lost)
   remove_orphan_files deletes files no snapshot references (left by failed or conflicting writes)
-It also deletes etl_run_log rows older than ETL_RUN_LOG_DAYS.
+It also deletes etl_run_log rows older than ETL_RUN_LOG_DAYS and container_log_lines rows older than
+LOG_LINES_RETENTION_DAYS.
 
 Run by run_etl.sh every cycle but only does work when the last successful maintenance is older than
 MAINTENANCE_INTERVAL_HOURS (default 24), so it effectively runs daily. `--force` runs it now.
@@ -24,11 +25,12 @@ import iceberg_state
 from sync_logs import LOCK_NAME
 
 TABLES = ["fact_access_events", "fact_error_events", "raw_log_landing", "etl_run_log",
-          "dim_dashboards", "dim_charts", "dim_users", "etl_lock"]
+          "dim_entities", "container_log_lines", "etl_lock"]
 RETENTION = os.environ.get("ICEBERG_RETENTION", "7d")
 FILE_SIZE_THRESHOLD = os.environ.get("ICEBERG_OPTIMIZE_FILE_SIZE", "128MB")
 INTERVAL_HOURS = float(os.environ.get("MAINTENANCE_INTERVAL_HOURS", "24"))
 RUN_LOG_DAYS = int(os.environ.get("ETL_RUN_LOG_DAYS", "90"))
+LOG_LINES_DAYS = int(os.environ.get("LOG_LINES_RETENTION_DAYS", "30"))
 
 
 def statements(table):
@@ -70,6 +72,11 @@ def main(force=False):
                                  % (iceberg_state.NOW_UTC, RUN_LOG_DAYS))
         except Exception as exc:  # noqa: BLE001
             failed.append("prune etl_run_log: " + str(exc)[:150])
+        try:
+            iceberg_sink.run_sql(conn, "DELETE FROM container_log_lines WHERE event_ts < %s - INTERVAL '%d' DAY"
+                                 % (iceberg_state.NOW_UTC, LOG_LINES_DAYS))
+        except Exception as exc:  # noqa: BLE001
+            failed.append("prune container_log_lines: " + str(exc)[:150])
         status = "ok" if not failed else "failed"
         iceberg_state.record_run(conn, "maintenance", status, detail="; ".join(failed))
         print("maintenance %s for %d tables (retention %s)" % ("done" if not failed else "finished with errors",

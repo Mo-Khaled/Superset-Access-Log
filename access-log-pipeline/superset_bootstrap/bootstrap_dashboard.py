@@ -7,7 +7,7 @@ after `superset-init` has created the admin user and the webserver is up. It:
   1. Registers the Superset database connection to Trino (catalog `iceberg`), the
      pipeline's only store (the same tables `etl/sync_logs.py` writes to).
   2. Registers the tables the usage dashboard needs as Superset datasets --
-     three physical (`fact_access_events`, `dim_dashboards`, `dim_users`) and
+     one physical (`fact_access_events`) and
      three "virtual" (SQL-defined) ones that hold the join/aggregation logic,
      since Superset's chart builder can't express a join against a single dataset.
   3. Creates the "Superset Usage Analytics" dashboard and its 7 charts,
@@ -16,9 +16,7 @@ after `superset-init` has created the admin user and the webserver is up. It:
 
 Safe to re-run: every step is get-or-create (by name) -- re-running this after the stack
 is already provisioned just confirms everything still exists and leaves it
-alone (or updates a chart's definition in place if it already exists). An install made
-when the pipeline still used MySQL is migrated: its datasets are pointed at Trino and the
-old MySQL connection is removed.
+alone (or updates a chart's definition in place if it already exists).
 
 Run standalone for debugging: `python superset_bootstrap/bootstrap_dashboard.py`
 (needs SUPERSET_BASE_URL/SUPERSET_ADMIN_* and TRINO_*; see .env / docker-compose.yml
@@ -36,7 +34,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from superset_client import SupersetClient  # noqa: E402
 import bootstrap_iceberg as ice  # noqa: E402
 
-LEGACY_DB_CONNECTION_NAME = "Access Log Pipeline (MySQL)"  # removed by migrate_legacy_database()
 CATALOG, SCHEMA = ice.CATALOG, ice.SCHEMA
 T = f"{CATALOG}.{SCHEMA}"  # tables are fully qualified in the virtual datasets' SQL
 DASHBOARD_TITLE = "Superset Usage Analytics"
@@ -49,55 +46,55 @@ SUPERSET_BASE_URL = os.environ.get("SUPERSET_BASE_URL", "http://superset:8088").
 MOST_VIEWED_DASHBOARDS_SQL = f"""
 SELECT
     f.dashboard_id AS dashboard_id,
-    COALESCE(d.title, 'Dashboard ' || CAST(f.dashboard_id AS varchar)) AS title,
+    COALESCE(d.name, 'Dashboard ' || CAST(f.dashboard_id AS varchar)) AS title,
     COUNT(*) AS view_count,
     COUNT(DISTINCT f.user_id) AS unique_viewers
 FROM {T}.fact_access_events f
-LEFT JOIN {T}.dim_dashboards d ON d.dashboard_id = f.dashboard_id
+LEFT JOIN {T}.dim_entities d ON d.entity_type = 'dashboard' AND d.entity_id = f.dashboard_id
 WHERE f.action = 'dashboard_view'
-GROUP BY f.dashboard_id, d.title
+GROUP BY f.dashboard_id, d.name
 """.strip()
 
-# `viewed` lists, per user, the TOP_VIEWED most viewed dashboards and charts with their view counts, then how many more
-# there are. Chart names come from dim_charts (a chart that no longer exists in Superset shows as "Chart <id> (removed)").
-TOP_VIEWED = 5
+# User Activity: per user, the TOP_VIEWED most viewed dashboards and charts (names with view counts) in two short
+# columns. Chart names come from dim_entities; a chart that no longer exists in Superset has no name and is left out here
+# (the detail table below lists the same thing in full, one row per user, dashboard and chart).
+TOP_VIEWED = 3
 USER_ACTIVITY_SQL = f"""
 WITH dash AS (
     SELECT user_id, title, n, rn, total FROM (
         SELECT f.user_id,
-               COALESCE(d.title, 'Dashboard ' || CAST(f.dashboard_id AS varchar)) AS title,
+               COALESCE(d.name, 'Dashboard ' || CAST(f.dashboard_id AS varchar)) AS title,
                COUNT(*) AS n,
                row_number() OVER (PARTITION BY f.user_id ORDER BY COUNT(*) DESC, f.dashboard_id) AS rn,
                count(*) OVER (PARTITION BY f.user_id) AS total
         FROM {T}.fact_access_events f
-        LEFT JOIN {T}.dim_dashboards d ON d.dashboard_id = f.dashboard_id
+        LEFT JOIN {T}.dim_entities d ON d.entity_type = 'dashboard' AND d.entity_id = f.dashboard_id
         WHERE f.action = 'dashboard_view' AND f.dashboard_id IS NOT NULL
-        GROUP BY f.user_id, f.dashboard_id, d.title
+        GROUP BY f.user_id, f.dashboard_id, d.name
     ) WHERE rn <= {TOP_VIEWED}
 ),
 chart AS (
     SELECT user_id, title, n, rn, total FROM (
-        SELECT f.user_id,
-               COALESCE(c.name, 'Chart ' || CAST(f.chart_id AS varchar) || ' (removed)') AS title,
+        SELECT f.user_id, c.name AS title,
                COUNT(*) AS n,
                row_number() OVER (PARTITION BY f.user_id ORDER BY COUNT(*) DESC, f.chart_id) AS rn,
                count(*) OVER (PARTITION BY f.user_id) AS total
         FROM {T}.fact_access_events f
-        LEFT JOIN {T}.dim_charts c ON c.chart_id = f.chart_id
-        WHERE f.action = 'chart_view' AND f.chart_id IS NOT NULL
+        JOIN {T}.dim_entities c ON c.entity_type = 'chart' AND c.entity_id = f.chart_id
+        WHERE f.action = 'chart_view'
         GROUP BY f.user_id, f.chart_id, c.name
     ) WHERE rn <= {TOP_VIEWED}
 ),
 dash_s AS (
     SELECT user_id,
-           array_join(array_agg(title || ' (' || CAST(n AS varchar) || ')' ORDER BY rn), ', ')
-           || CASE WHEN max(total) > {TOP_VIEWED} THEN ' +' || CAST(max(total) - {TOP_VIEWED} AS varchar) || ' more' ELSE '' END AS s
+           array_join(array_agg(title || ' (' || CAST(n AS varchar) || ')' ORDER BY rn), '; ')
+           || CASE WHEN max(total) > {TOP_VIEWED} THEN '; +' || CAST(max(total) - {TOP_VIEWED} AS varchar) || ' more' ELSE '' END AS s
     FROM dash GROUP BY user_id
 ),
 chart_s AS (
     SELECT user_id,
-           array_join(array_agg(title || ' (' || CAST(n AS varchar) || ')' ORDER BY rn), ', ')
-           || CASE WHEN max(total) > {TOP_VIEWED} THEN ' +' || CAST(max(total) - {TOP_VIEWED} AS varchar) || ' more' ELSE '' END AS s
+           array_join(array_agg(title || ' (' || CAST(n AS varchar) || ')' ORDER BY rn), '; ')
+           || CASE WHEN max(total) > {TOP_VIEWED} THEN '; +' || CAST(max(total) - {TOP_VIEWED} AS varchar) || ' more' ELSE '' END AS s
     FROM chart GROUP BY user_id
 ),
 activity AS (
@@ -111,32 +108,49 @@ activity AS (
 )
 SELECT
     a.user_id AS user_id,
-    COALESCE(u.username, 'user_' || CAST(a.user_id AS varchar)) AS username,
+    COALESCE(u.name, 'user_' || CAST(a.user_id AS varchar)) AS username,
     a.event_count AS event_count,
     a.dashboard_views AS dashboard_views,
     a.chart_views AS chart_views,
     a.last_active AS last_active,
-    'Dashboards: ' || COALESCE(ds.s, '-') || ' | Charts: ' || COALESCE(cs.s, '-') AS viewed
+    COALESCE(ds.s, '-') AS top_dashboards,
+    COALESCE(cs.s, '-') AS top_charts
 FROM activity a
-LEFT JOIN {T}.dim_users u ON u.user_id = a.user_id
+LEFT JOIN {T}.dim_entities u ON u.entity_type = 'user' AND u.entity_id = a.user_id
 LEFT JOIN dash_s ds ON ds.user_id = a.user_id
 LEFT JOIN chart_s cs ON cs.user_id = a.user_id
 """.strip()
 
+# One row per user, dashboard and chart: the full answer to "what does each user view?". Existing charts only.
+USER_VIEWS_SQL = f"""
+SELECT
+    COALESCE(u.name, 'user_' || CAST(f.user_id AS varchar)) AS username,
+    COALESCE(d.name, 'Dashboard ' || CAST(f.dashboard_id AS varchar)) AS dashboard,
+    c.name AS chart,
+    COUNT(*) AS views,
+    MAX(f.event_ts) AS last_viewed
+FROM {T}.fact_access_events f
+JOIN {T}.dim_entities c ON c.entity_type = 'chart' AND c.entity_id = f.chart_id
+LEFT JOIN {T}.dim_entities d ON d.entity_type = 'dashboard' AND d.entity_id = f.dashboard_id
+LEFT JOIN {T}.dim_entities u ON u.entity_type = 'user' AND u.entity_id = f.user_id
+WHERE f.action = 'chart_view'
+GROUP BY f.user_id, u.name, f.dashboard_id, d.name, f.chart_id, c.name
+""".strip()
+
 ZERO_VIEW_DASHBOARDS_SQL = f"""
 SELECT
-    d.dashboard_id AS dashboard_id,
-    d.title AS title,
+    d.entity_id AS dashboard_id,
+    d.name AS title,
     COALESCE(d.owner_names, '') AS owner_names,
     COALESCE(v.view_count, 0) AS view_count
-FROM {T}.dim_dashboards d
+FROM {T}.dim_entities d
 LEFT JOIN (
     SELECT dashboard_id, COUNT(*) AS view_count
     FROM {T}.fact_access_events
     WHERE action = 'dashboard_view'
     GROUP BY dashboard_id
-) v ON v.dashboard_id = d.dashboard_id
-WHERE COALESCE(v.view_count, 0) <= 1
+) v ON v.dashboard_id = d.entity_id
+WHERE d.entity_type = 'dashboard' AND COALESCE(v.view_count, 0) <= 1
 """.strip()
 
 # Explicit column fallback for the virtual datasets above -- see
@@ -157,7 +171,15 @@ USER_ACTIVITY_COLUMNS = [
     ("dashboard_views", "BIGINT", False),
     ("chart_views", "BIGINT", False),
     ("last_active", "TIMESTAMP(6)", True),
-    ("viewed", "VARCHAR", False),
+    ("top_dashboards", "VARCHAR", False),
+    ("top_charts", "VARCHAR", False),
+]
+USER_VIEWS_COLUMNS = [
+    ("username", "VARCHAR", False),
+    ("dashboard", "VARCHAR", False),
+    ("chart", "VARCHAR", False),
+    ("views", "BIGINT", False),
+    ("last_viewed", "TIMESTAMP(6)", True),
 ]
 ZERO_VIEW_DASHBOARDS_COLUMNS = [
     ("dashboard_id", "INTEGER", False),
@@ -194,25 +216,6 @@ def get_one(client, path, rison_filter):
 
 def get_or_create_database(client):
     return ice.get_or_create_trino_database(client, sys.modules[__name__])
-
-
-def migrate_legacy_database(client, new_db_id):
-    """Installs made when the pipeline used MySQL still have datasets bound to that connection. Point them at Trino,
-    then drop the old connection. Best effort: a failure here leaves the old connection in place, harmlessly."""
-    old = get_one(client, "/api/v1/database/",
-                  f"(filters:!((col:database_name,opr:eq,value:'{LEGACY_DB_CONNECTION_NAME}')))")
-    if not old:
-        return
-    try:
-        resp = client.get(f"/api/v1/dataset/?q=(filters:!((col:database,opr:rel_o_m,value:{old['id']})),page_size:100)")
-        for d in resp.json().get("result", []):
-            client.session.put(f"{client.base_url}/api/v1/dataset/{d['id']}",
-                               json={"database_id": new_db_id, "schema": SCHEMA}, timeout=60).raise_for_status()
-            print(f"moved dataset '{d['table_name']}' from the MySQL connection to Trino")
-        client.session.delete(f"{client.base_url}/api/v1/database/{old['id']}", timeout=60).raise_for_status()
-        print(f"removed the old '{LEGACY_DB_CONNECTION_NAME}' connection")
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARNING: could not migrate the old MySQL connection ({exc}); remove it by hand in Superset")
 
 
 def _dataset_columns(client, dataset_id):
@@ -270,7 +273,7 @@ def get_or_create_dataset(client, db_id, table_name, sql=None, column_defs=None)
     )
     if existing:
         dataset_id = existing["id"]
-        # keep the dataset's SQL and connection in step with this file (an older install pointed at MySQL)
+        # keep the dataset's SQL and connection in step with this file
         update = {"database_id": db_id, "schema": SCHEMA}
         if sql:
             update["sql"] = sql
@@ -447,10 +450,26 @@ def user_activity_params(dataset_id):
                 "dashboard_views",
                 "chart_views",
                 "last_active",
-                "viewed",
+                "top_dashboards",
+                "top_charts",
             ],
             "order_by_cols": ['["event_count", false]'],
             "row_limit": 50,
+            "server_pagination": False,
+            "time_range": "No filter",
+        }
+    )
+    return p
+
+
+def user_views_params(dataset_id):
+    p = _base_params(dataset_id, "table")
+    p.update(
+        {
+            "query_mode": "raw",
+            "all_columns": ["username", "dashboard", "chart", "views", "last_viewed"],
+            "order_by_cols": ['["username", true]', '["views", false]'],
+            "row_limit": 1000,
             "server_pagination": False,
             "time_range": "No filter",
         }
@@ -508,12 +527,9 @@ def main():
     client = SupersetClient()
 
     db_id = get_or_create_database(client)
-    migrate_legacy_database(client, db_id)
 
     fact_id = get_or_create_dataset(client, db_id, "fact_access_events")
     ice.mark_time_column(client, sys.modules[__name__], fact_id, "event_ts")  # Superset offers day/week/month grains
-    get_or_create_dataset(client, db_id, "dim_dashboards")
-    get_or_create_dataset(client, db_id, "dim_users")
 
     most_viewed_id = get_or_create_dataset(
         client, db_id, "vw_most_viewed_dashboards",
@@ -522,6 +538,10 @@ def main():
     user_activity_id = get_or_create_dataset(
         client, db_id, "vw_user_activity",
         sql=USER_ACTIVITY_SQL, column_defs=USER_ACTIVITY_COLUMNS,
+    )
+    user_views_id = get_or_create_dataset(
+        client, db_id, "vw_user_views",
+        sql=USER_VIEWS_SQL, column_defs=USER_VIEWS_COLUMNS,
     )
     zero_view_id = get_or_create_dataset(
         client, db_id, "vw_zero_view_dashboards",
@@ -549,6 +569,10 @@ def main():
     get_or_create_chart(
         client, "User Activity", user_activity_id, "table",
         user_activity_params(user_activity_id), dashboard_id,
+    )
+    get_or_create_chart(
+        client, "Dashboards and Charts Viewed by User", user_views_id, "table",
+        user_views_params(user_views_id), dashboard_id,
     )
     get_or_create_chart(
         client, "Zero-View Dashboards", zero_view_id, "table",

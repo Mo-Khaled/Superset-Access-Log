@@ -1,10 +1,10 @@
 """
-ETL state that used to live in MySQL, rebuilt on Iceberg tables so Trino is the only dependency:
+ETL state, kept in Iceberg tables so Trino is the only dependency:
 
-  * Lease       the single-writer guard (was a MySQL advisory lock). A row in `etl_lock` with an expiry.
-  * Watermark   max(source_dttm) of raw_log_landing (was etl_sync_state). Derived from the data, not stored beside it,
+  * Lease       the single-writer guard: a row in `etl_lock` with an expiry.
+  * Watermark   max(source_dttm) of raw_log_landing. Derived from the data, not stored beside it,
                 so it can never disagree with what was actually written.
-  * Run log     one row per run in `etl_run_log` (was etl_sync_state.updated_at), for the "pipeline is stale" alert.
+  * Run log     one row per run in `etl_run_log`, for the "pipeline is stale" alert.
 
 How the lease stays safe without locks: Iceberg commits are atomic and serializable per table. Two runs that try to
 take the lock at the same moment issue the same MERGE; one commit wins, the other fails with a commit conflict and is
@@ -123,10 +123,3 @@ def record_run(conn, kind, status, rows_read=0, rows_new=0, detail=""):
                 % (NOW_UTC, _q(kind), _q(status), int(rows_read), int(rows_new), _q(detail[:500])), retries=2)
     except Exception:  # noqa: BLE001
         pass
-
-
-def last_successful_run(conn, kind):
-    """Timestamp (naive UTC) of the latest etl_run_log row with status 'ok' for this kind, or None."""
-    rows = run_sql(conn, "SELECT max(run_ts) FROM etl_run_log WHERE kind = %s AND status = 'ok'" % _q(kind))
-    return rows[0][0] if rows and rows[0][0] is not None else None
-

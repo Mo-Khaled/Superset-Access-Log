@@ -1,6 +1,9 @@
--- Day grain, per dashboard. Superset sums these and applies its own time grain (day, week, month), so the rate is
+-- Day grain, per dashboard. Columns are in reading order: the failure rate sits next to the counts it comes from; title is never
+-- empty ('(not from a dashboard)' for requests that had none, 'Dashboard N (removed)' for a deleted one).
+-- failure_rate = failed_loads / rated_loads for that one row, for reading in a SQL client. It is not additive. Superset sums these and applies its own time grain (day, week, month), so the rate is
 -- SUM(failed_loads) / SUM(rated_loads): a ratio of sums, not an average of daily ratios.
 --
+--   failure_rate  = failed_loads / rated_loads for the row (NULL when rated_loads is 0)
 --   chart_loads   = chart views (every chart load attempt, including failed ones)
 --   failed_loads  = browser-reported failures: the same client event as a chart view, so numerator and denominator share
 --                   a unit. Authorization denials are left out unless AUTHZ_COUNTS_AS_FAILURE is true (see below).
@@ -37,17 +40,24 @@ errs AS (
     GROUP BY 1, 2
 )
 SELECT
-    coalesce(l.day, e.day) AS day,
-    coalesce(l.dashboard_id, e.dashboard_id) AS dashboard_id,
-    d.title AS title,
-    coalesce(l.chart_loads, 0) AS chart_loads,
-    greatest(coalesce(l.chart_loads, 0) - CASE WHEN {{AUTHZ_COUNTS}} THEN 0 ELSE coalesce(e.browser_denied, 0) END, 0) AS rated_loads,
-    coalesce(e.failed_loads, 0) AS failed_loads,
-    greatest(coalesce(e.browser_denied, 0), coalesce(e.server_denied, 0)) AS authorization_denied,
-    coalesce(e.server_kills, 0) AS server_kills,
-    coalesce(e.server_errors, 0) AS server_errors
-FROM loads l
-FULL OUTER JOIN errs e
-    ON l.day = e.day AND l.dashboard_id IS NOT DISTINCT FROM e.dashboard_id
-LEFT JOIN dim_dashboards d
-    ON d.dashboard_id = coalesce(l.dashboard_id, e.dashboard_id)
+    day, dashboard_id, title, chart_loads, failed_loads,
+    CAST(failed_loads AS double) / NULLIF(rated_loads, 0) AS failure_rate,
+    rated_loads, authorization_denied, server_kills, server_errors
+FROM (
+    SELECT
+        coalesce(l.day, e.day) AS day,
+        coalesce(l.dashboard_id, e.dashboard_id) AS dashboard_id,
+        coalesce(d.name, CASE WHEN coalesce(l.dashboard_id, e.dashboard_id) IS NULL THEN '(not from a dashboard)'
+                              ELSE 'Dashboard ' || CAST(coalesce(l.dashboard_id, e.dashboard_id) AS varchar) || ' (removed)' END) AS title,
+        coalesce(l.chart_loads, 0) AS chart_loads,
+        greatest(coalesce(l.chart_loads, 0) - CASE WHEN {{AUTHZ_COUNTS}} THEN 0 ELSE coalesce(e.browser_denied, 0) END, 0) AS rated_loads,
+        coalesce(e.failed_loads, 0) AS failed_loads,
+        greatest(coalesce(e.browser_denied, 0), coalesce(e.server_denied, 0)) AS authorization_denied,
+        coalesce(e.server_kills, 0) AS server_kills,
+        coalesce(e.server_errors, 0) AS server_errors
+    FROM loads l
+    FULL OUTER JOIN errs e
+        ON l.day = e.day AND l.dashboard_id IS NOT DISTINCT FROM e.dashboard_id
+    LEFT JOIN dim_entities d
+        ON d.entity_type = 'dashboard' AND d.entity_id = coalesce(l.dashboard_id, e.dashboard_id)
+)

@@ -89,7 +89,7 @@ def main():
     tr = iceberg_sink.trino_conn()
 
     # a real dashboard and chart to hang the test rows on
-    dash = iceberg_sink.run_sql(tr, "SELECT dashboard_id FROM dim_dashboards ORDER BY dashboard_id LIMIT 1")[0][0]
+    dash = iceberg_sink.run_sql(tr, "SELECT entity_id FROM dim_entities WHERE entity_type = 'dashboard' ORDER BY entity_id LIMIT 1")[0][0]
     chart = 1
 
     print("0. baseline run so the watermark is current")

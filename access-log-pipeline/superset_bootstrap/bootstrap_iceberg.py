@@ -32,15 +32,15 @@ DASHBOARD_TITLE = "Dashboard Reliability and Speed"
 FAILURE_RATE_SQL = f"SELECT * FROM {CATALOG}.{SCHEMA}.vw_chart_failure_rate"
 FAILURE_RATE_COLUMNS = [
     ("day", "DATE", True), ("dashboard_id", "INTEGER", False), ("title", "VARCHAR", False),
-    ("chart_loads", "BIGINT", False), ("rated_loads", "BIGINT", False), ("failed_loads", "BIGINT", False),
+    ("chart_loads", "BIGINT", False), ("failure_rate", "DOUBLE", False), ("rated_loads", "BIGINT", False), ("failed_loads", "BIGINT", False),
     ("authorization_denied", "BIGINT", False), ("server_kills", "BIGINT", False), ("server_errors", "BIGINT", False),
 ]
 
 CHART_LOADS_SQL = f"""
-SELECT a.event_ts, a.dashboard_id, coalesce(d.title, 'Dashboard ' || cast(a.dashboard_id AS varchar)) AS title,
+SELECT a.event_ts, a.dashboard_id, coalesce(d.name, 'Dashboard ' || cast(a.dashboard_id AS varchar)) AS title,
        a.chart_id, a.user_id, a.duration_ms, a.is_error
 FROM {CATALOG}.{SCHEMA}.fact_access_events a
-LEFT JOIN {CATALOG}.{SCHEMA}.dim_dashboards d ON d.dashboard_id = a.dashboard_id
+LEFT JOIN {CATALOG}.{SCHEMA}.dim_entities d ON d.entity_type = 'dashboard' AND d.entity_id = a.dashboard_id
 WHERE a.action = 'chart_view' AND a.event_ts <= CAST(current_timestamp AT TIME ZONE 'UTC' AS timestamp(6))
 """.strip()
 CHART_LOADS_COLUMNS = [
@@ -64,10 +64,10 @@ WITH reported AS (
 SELECT e.event_ts, e.source, coalesce(e.error_category, 'unclassified') AS error_category, e.error_type,
        coalesce(e.error_signature, e.error_type) AS error_signature,
        coalesce(e.error_message, e.reason) AS error_message, e.status_code, e.request_path,
-       coalesce(d.title, '') AS dashboard, e.chart_id, e.user_id, e.duration_ms, e.reason,
+       coalesce(d.name, '') AS dashboard, e.chart_id, e.user_id, e.duration_ms, e.reason,
        coalesce(r.also_in_browser, false) AS also_in_browser
 FROM {CATALOG}.{SCHEMA}.fact_error_events e
-LEFT JOIN {CATALOG}.{SCHEMA}.dim_dashboards d ON d.dashboard_id = e.dashboard_id
+LEFT JOIN {CATALOG}.{SCHEMA}.dim_entities d ON d.entity_type = 'dashboard' AND d.entity_id = e.dashboard_id
 LEFT JOIN reported r ON r.dedupe_key = e.dedupe_key
 """.strip()
 CHART_ERRORS_COLUMNS = [

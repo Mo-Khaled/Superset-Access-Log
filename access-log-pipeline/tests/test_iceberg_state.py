@@ -191,8 +191,7 @@ sink.flush()
 order = [target(s) for s in conn.sql]
 check("raw rows are written last", order[-1] == "raw_log_landing" and order.index("fact_access_events") < order.index("raw_log_landing"),
       str(order))
-check("dimensions are written before raw rows", order.index("dim_dashboards") < order.index("raw_log_landing")
-      and order.index("dim_users") < order.index("raw_log_landing"), str(order))
+check("dimensions are written before raw rows", order.index("dim_entities") < order.index("raw_log_landing"), str(order))
 
 # a raw chunk that fills up mid-run must first store the facts collected so far
 iceberg_sink.RAW_BATCH_ROWS = 2
